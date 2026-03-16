@@ -105,37 +105,86 @@ from pydantic import Field
 
 
 class NapCatWSConfig(Base):
-    """NapCat WS channel configuration.
+    """NapCat WS 渠道配置（按 Telegram 渠道的模式：配置模型放在各自的 channel 文件里）。
 
-    Stored under config.channels.napcatWs (extra dict).
+    为什么放在这里：
+    - 上游的 `nanobot/config/schema.py` 保持干净（channels 配置允许 extra）。
+    - 每个 channel 自己维护字段与默认值，方便演进，也方便清理死字段。
+
+    配置路径：
+        config.channels.napcatWs
+
+    命名规则：
+    - Python 字段使用 snake_case。
+    - 配置文件既可以用 snake_case（例如 `poke_cooldown_seconds`），也可以用 camelCase
+      （例如 `pokeCooldownSeconds`、`privateTriggerProbability`），具体取决于 Base 的 alias 规则。
     """
 
-    enabled: bool = False
-    url: str = ""
-    token: str = ""
+    # --- 连接 ---
+    enabled: bool = Field(default=False, description="是否启用 NapCatWS 渠道")
+    url: str = Field(default="", description="WebSocket 地址，例如 ws://localhost:3001/")
+    token: str = Field(default="", description="NapCat/OneBot 的 token（如果服务端要求）")
 
-    allow_from: list[str] = Field(default_factory=list)
-    blacklist_private_ids: list[str] = Field(default_factory=list)
-    blacklist_group_ids: list[str] = Field(default_factory=list)
+    # --- 白名单 / 黑名单 ---
+    allow_from: list[str] = Field(
+        default_factory=list,
+        description="允许响应的会话 id 列表（字符串）。为空表示不做 allowlist 限制（仍会受黑名单影响）。",
+    )
+    blacklist_private_ids: list[str] = Field(
+        default_factory=list,
+        description="私聊黑名单 user_id 列表（字符串）",
+    )
+    blacklist_group_ids: list[str] = Field(
+        default_factory=list,
+        description="群聊黑名单 group_id 列表（字符串）",
+    )
 
-    private_trigger_probability: float = 0.0
-    group_trigger_probability: float = 0.0
+    # --- 概率触发 ---
+    private_trigger_probability: float = Field(
+        default=0.05,
+        description="私聊随机触发概率（0~1），默认 0.05",
+    )
+    group_trigger_probability: float = Field(
+        default=0.05,
+        description="群聊随机触发概率（0~1），默认 0.05",
+    )
 
-    nickname_triggers: list[str] = Field(default_factory=list)
+    # --- 昵称/关键词触发 ---
+    nickname_triggers: list[str] = Field(
+        default_factory=list,
+        description="消息中包含任一昵称/关键词即触发",
+    )
 
-    trigger_on_poke: bool = False
-    poke_cooldown_seconds: int = 60
+    # --- Notice 触发（系统通知类） ---
+    trigger_on_poke: bool = Field(default=False, description="收到戳一戳（poke）通知时触发")
+    poke_cooldown_seconds: int = Field(
+        default=60,
+        description="戳一戳触发冷却（秒）。<=0 表示关闭冷却。默认 60 秒。",
+    )
 
-    trigger_on_at: bool = True
-    trigger_on_reply_to_bot: bool = True
+    # --- 关系触发（@ / 回复） ---
+    trigger_on_at: bool = Field(default=True, description="群聊中 @ 机器人时触发")
+    trigger_on_reply_to_bot: bool = Field(default=True, description="回复机器人消息时触发")
 
-    context_max_messages: int = 25
-    session_buffer_size: int = 50
+    # --- 上下文 / 会话限制 ---
+    context_max_messages: int = Field(default=25, description="构建上下文时最多读取的消息条数")
+    session_buffer_size: int = Field(default=50, description="内存会话环形缓冲区大小")
 
-    user_text_truncate_chars: int = 200
-    ignore_self_messages: bool = True
+    # --- 输入整形 ---
+    user_text_truncate_chars: int = Field(
+        default=200,
+        description="用户文本过长时的截断长度，用于避免上下文变得难读",
+    )
+    ignore_self_messages: bool = Field(
+        default=True,
+        description="忽略机器人自身发送的消息，避免自我回声/死循环",
+    )
 
-    multi_turn_max_replies: int = 3
+    # --- 多轮回复 ---
+    multi_turn_max_replies: int = Field(
+        default=3,
+        description="一次多轮追问中最多连续回复的次数",
+    )
 
 # NOTE: transport层也会用到 OneBot action 常量（get_login_info）
 
