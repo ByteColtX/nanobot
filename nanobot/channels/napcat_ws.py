@@ -128,7 +128,13 @@ class NapCatWSConfig(Base):
     # --- 白名单 / 黑名单 ---
     allow_from: list[str] = Field(
         default_factory=list,
-        description="允许响应的会话 id 列表（字符串）。为空表示不做 allowlist 限制（仍会受黑名单影响）。",
+        description=(
+            "允许触发的来源列表（字符串）。\n"
+            "支持两种用法：\n"
+            "- 填 user_id：允许指定用户（私聊/群内发言者）\n"
+            "- 填 group_id：允许指定群（群内任何人都可触发）\n"
+            "为空表示不做白名单限制（全部允许），仍会受黑名单影响。"
+        ),
     )
     blacklist_private_ids: list[str] = Field(
         default_factory=list,
@@ -2507,6 +2513,22 @@ class NapCatWSChannel(BaseChannel):
 
         if not decision.should_reply:
             return
+
+        # allowFrom 语义（NapCatWS 扩展）：
+        # BaseChannel 只按 sender_id 做 allowlist 判断，但 napcat_ws 的 allowFrom 既可能填 user_id，
+        # 也可能填 group_id（允许白名单群里任何人触发）。
+        allow_list = [str(x) for x in (getattr(self.config, "allow_from", []) or []) if str(x).strip()]
+        if allow_list and "*" not in allow_list:
+            sender_ok = str(msg.sender_id) in allow_list
+            chat_ok = (msg.chat.chat_type == "group" and str(msg.chat.chat_id) in allow_list)
+            if not (sender_ok or chat_ok):
+                logger.warning(
+                    "Access denied for sender {} on channel {}. Add them or the group_id({}) to allowFrom list.",
+                    msg.sender_id,
+                    self.name,
+                    msg.chat.chat_id,
+                )
+                return
 
         bot_name = ""
         try:
