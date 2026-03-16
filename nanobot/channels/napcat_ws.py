@@ -2515,12 +2515,32 @@ class NapCatWSChannel(BaseChannel):
             return
 
         # allowFrom 语义（NapCatWS 扩展）：
-        # BaseChannel 只按 sender_id 做 allowlist 判断，但 napcat_ws 的 allowFrom 既可能填 user_id，
-        # 也可能填 group_id（允许白名单群里任何人触发）。
+        #
+        # 需求：允许“用户白名单”和“群白名单”两种写法，同时“黑名单优先级最高”。
+        # 例如：用户A在 allowFrom 中，但用户A在黑名单群里发言 —— 预期仍然不能触发。
+        #
+        # 说明：BaseChannel 只按 sender_id 做 allowlist 判断；而 napcat_ws 的 allowFrom 既可能填 user_id，
+        # 也可能填 group_id（允许白名单群里任何人触发）。因此这里在调用 super()._handle_message() 前先拦一次。
+
+        # 1) 黑名单优先（防御性：即使上游 trigger 决策已做过黑名单判断，这里仍再次确保）
+        if msg.chat.chat_type == "group":
+            gid = str(msg.chat.group_id or msg.chat.chat_id)
+            blk_groups = set(str(x) for x in (getattr(self.config, "blacklist_group_ids", []) or []))
+            if gid in blk_groups:
+                logger.debug("napcat_ws message ignored: blacklist_group ({})", gid)
+                return
+        else:
+            blk_priv = set(str(x) for x in (getattr(self.config, "blacklist_private_ids", []) or []))
+            # 私聊场景：既屏蔽 user_id，也屏蔽 chat_id（通常相同，但保留兼容）
+            if str(msg.sender_id) in blk_priv or str(msg.chat.chat_id) in blk_priv:
+                logger.debug("napcat_ws message ignored: blacklist_private ({})", msg.sender_id)
+                return
+
+        # 2) allowFrom 白名单（为空 → 不限制；包含 * → 全允许）
         allow_list = [str(x) for x in (getattr(self.config, "allow_from", []) or []) if str(x).strip()]
         if allow_list and "*" not in allow_list:
             sender_ok = str(msg.sender_id) in allow_list
-            chat_ok = (msg.chat.chat_type == "group" and str(msg.chat.chat_id) in allow_list)
+            chat_ok = (msg.chat.chat_type == "group" and str(msg.chat.group_id) in allow_list)
             if not (sender_ok or chat_ok):
                 logger.warning(
                     "Access denied for sender {} on channel {}. Add them or the group_id({}) to allowFrom list.",
