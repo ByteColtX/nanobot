@@ -99,7 +99,43 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir
-from nanobot.config.schema import NapCatWSConfig
+from nanobot.config.schema import Base
+
+from pydantic import Field
+
+
+class NapCatWSConfig(Base):
+    """NapCat WS channel configuration.
+
+    Stored under config.channels.napcatWs (extra dict).
+    """
+
+    enabled: bool = False
+    url: str = ""
+    token: str = ""
+
+    allow_from: list[str] = Field(default_factory=list)
+    blacklist_private_ids: list[str] = Field(default_factory=list)
+    blacklist_group_ids: list[str] = Field(default_factory=list)
+
+    private_trigger_probability: float = 0.0
+    group_trigger_probability: float = 0.0
+
+    nickname_triggers: list[str] = Field(default_factory=list)
+
+    trigger_on_poke: bool = False
+    poke_cooldown_seconds: int = 60
+
+    trigger_on_at: bool = True
+    trigger_on_reply_to_bot: bool = True
+
+    context_max_messages: int = 25
+    session_buffer_size: int = 50
+
+    user_text_truncate_chars: int = 200
+    ignore_self_messages: bool = True
+
+    multi_turn_max_replies: int = 3
 
 # NOTE: transport层也会用到 OneBot action 常量（get_login_info）
 
@@ -1724,7 +1760,13 @@ class NapCatWSChannel(BaseChannel):
     name = "napcat_ws"
     display_name = "NapCat WS"
 
-    def __init__(self, config: NapCatWSConfig, bus: MessageBus) -> None:
+    @classmethod
+    def default_config(cls) -> dict[str, Any]:
+        return NapCatWSConfig().model_dump(by_alias=True)
+
+    def __init__(self, config: Any, bus: MessageBus) -> None:
+        if isinstance(config, dict):
+            config = NapCatWSConfig.model_validate(config)
         super().__init__(config=config, bus=bus)
 
         self.config: NapCatWSConfig = config
