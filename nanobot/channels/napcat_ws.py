@@ -1836,11 +1836,10 @@ def _stable_random_0_1(seed: str) -> float:
 def _is_allowed_source(msg: NormalizedInbound, config: NapCatWSConfig) -> bool:
     """allow_from 白名单判断。
 
-    兼容几种常见写法：
+    仅支持三种语义：
       - "*"：全部允许
-      - "<sender_id>"：按发送者
-      - "<chat_id>"：按会话 id（私聊=对方 id；群聊=群号）
-      - "group:<group_id>" / "private:<user_id>"：按 chat_type 显式写
+      - "<群号>"：允许对应群聊
+      - "<QQ号>"：允许对应私聊 / 对应发送者
     """
 
     allow = list(getattr(config, "allow_from", []) or [])
@@ -1853,23 +1852,12 @@ def _is_allowed_source(msg: NormalizedInbound, config: NapCatWSConfig) -> bool:
         return True
 
     sender_id = str(msg.sender_id or "").strip()
-    chat_id = str(msg.chat.chat_id or "").strip()
-
-    if sender_id and sender_id in allow:
-        return True
-    if chat_id and chat_id in allow:
-        return True
-
     if msg.chat.chat_type == "group":
         gid = str(msg.chat.group_id or msg.chat.chat_id or "").strip()
-        if gid and f"group:{gid}" in allow:
-            return True
-    else:
-        uid = str(msg.chat.user_id or msg.chat.chat_id or "").strip()
-        if uid and f"private:{uid}" in allow:
-            return True
+        return bool(gid and gid in allow)
 
-    return False
+    uid = str(msg.chat.user_id or msg.chat.chat_id or sender_id or "").strip()
+    return bool((uid and uid in allow) or (sender_id and sender_id in allow))
 
 
 def _is_reply_to_bot(
@@ -2013,6 +2001,7 @@ def _check_publish_gate(
 
     说明：
     - 这不是 trigger policy；只是 channel 在真正 publish 给 agent 前的防御性 gate。
+    - allow_from 仅支持三种语义：`*`、群号、QQ号。
     - 当前保留与既有行为一致的 allowFrom / blacklist 语义。
     """
 
@@ -2724,26 +2713,7 @@ class NapCatWSChannel(BaseChannel):
             actor_id=str(actor),
             group_id=str(chat.group_id),
         )
-        allowed, reason = _check_publish_gate(gate, config=self.config, channel_name=self.name)
-        if not allowed:
-            if reason == "blacklist_group":
-                logger.debug("napcat_ws notice ignored: blacklist_group ({})", chat.group_id)
-                return
-            if reason == "blacklist_private":
-                logger.debug("napcat_ws notice ignored: blacklist_private ({})", actor)
-                return
-            if chat.chat_type == "group":
-                logger.warning(
-                    "Access denied for group_id {} on channel {}. Add this group_id to allowFrom list.",
-                    str(chat.group_id or "").strip() or "(empty)",
-                    self.name,
-                )
-                return
-            logger.warning(
-                "Access denied for sender {} on channel {}. Add them to allowFrom list.",
-                actor,
-                self.name,
-            )
+        if not self._allow_publish_to_agent(gate, kind="notice"):
             return
 
         inbound = InboundMessage(
@@ -3095,32 +3065,27 @@ class NapCatWSChannel(BaseChannel):
             session_key_override=session_key,
         )
 
-    def _allow_publish_to_agent(self, msg: NormalizedInbound) -> bool:
-        gate = PublishGateInput(
-            chat_type=msg.chat.chat_type,
-            actor_id=str(msg.sender_id),
-            group_id=str(msg.chat.group_id),
-        )
+    def _allow_publish_to_agent(self, gate: PublishGateInput, *, kind: str) -> bool:
         allowed, reason = _check_publish_gate(gate, config=self.config, channel_name=self.name)
         if allowed:
             return True
 
         if reason == "blacklist_group":
-            logger.debug("napcat_ws message ignored: blacklist_group ({})", msg.chat.group_id)
+            logger.debug("napcat_ws {} ignored: blacklist_group ({})", kind, gate.group_id)
             return False
         if reason == "blacklist_private":
-            logger.debug("napcat_ws message ignored: blacklist_private ({})", msg.sender_id)
+            logger.debug("napcat_ws {} ignored: blacklist_private ({})", kind, gate.actor_id)
             return False
-        if msg.chat.chat_type == "group":
+        if gate.chat_type == "group":
             logger.warning(
                 "Access denied for group_id {} on channel {}. Add this group_id to allowFrom list.",
-                str(msg.chat.group_id or "").strip() or "(empty)",
+                str(gate.group_id or "").strip() or "(empty)",
                 self.name,
             )
             return False
         logger.warning(
             "Access denied for sender {} on channel {}. Add them to allowFrom list.",
-            msg.sender_id,
+            gate.actor_id,
             self.name,
         )
         return False
@@ -3172,7 +3137,12 @@ class NapCatWSChannel(BaseChannel):
         if not decision.should_reply:
             return
 
-        if not self._allow_publish_to_agent(msg):
+        gate = PublishGateInput(
+            chat_type=msg.chat.chat_type,
+            actor_id=str(msg.sender_id),
+            group_id=str(msg.chat.group_id),
+        )
+        if not self._allow_publish_to_agent(gate, kind="message"):
             return
 
         bot_name = ""
