@@ -412,12 +412,14 @@ class ExpandedForward:
       - id：forward id
       - items：转发节点摘要列表（上下文友好）。为了省 token，节点只保留缩写字段：
           {"u": "张三", "m": "好吃"}
+      - media_meta：转发节点中抽取的结构化媒体元数据（用于下载图片等），不进入上下文序列化。
 
     注意：这里只定义数据结构；具体拉取(get_forward_msg)/解析/截断规则后续实现。
-    """
+    """ 
 
     id: str
     items: list[dict[str, str]] = field(default_factory=list)
+    media_meta: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -927,12 +929,16 @@ class NapCatMessageDetailFetcherV2:
             return ExpandedForward(id=fid)
 
         items: list[dict[str, str]] = []
+        media_meta: list[dict[str, Any]] = []
         for node in nodes:
             if isinstance(node, str):
                 payload_like = {"message": node, "raw_message": node, "message_format": "string"}
                 parsed = self._parser.parse(payload=payload_like, self_id="")
                 m = parsed.cq_text or str(node)
                 items.append({"u": "unknown", "m": m})
+                # 尝试从 CQ 字符串解析图片（https url）
+                if parsed.media_meta:
+                    media_meta.extend(list(parsed.media_meta))
                 continue
 
             if not isinstance(node, dict):
@@ -952,8 +958,10 @@ class NapCatMessageDetailFetcherV2:
             parsed = self._parser.parse(payload=payload_like, self_id="")
             m = parsed.cq_text or str(node.get("raw_message") or "").strip()
             items.append({"u": u, "m": m})
+            if parsed.media_meta:
+                media_meta.extend(list(parsed.media_meta))
 
-        return ExpandedForward(id=fid, items=items)
+        return ExpandedForward(id=fid, items=items, media_meta=media_meta)
 
 
 
@@ -2586,6 +2594,19 @@ class NapCatWSChannel(BaseChannel):
         await self._expand_quote(msg)
         await self._expand_forward(msg)
 
+        # 关键修复：把合并转发里的图片也喂给大模型。
+        # forward_items 的 media_paths 目前是“全集合附在每个 item 上”（不做 per-node 对齐），
+        # 这里只需要聚合成一份列表即可。
+        try:
+            for it in msg.forward_items:
+                if not isinstance(it, dict):
+                    continue
+                for p in (it.get("media_paths") or []):
+                    if isinstance(p, str) and p and p not in msg.media_paths:
+                        msg.media_paths.append(p)
+        except Exception:
+            pass
+
         session_key = make_session_key(msg.chat)
 
         # 先决策（避免把当前 msg 写入 store 后又被 history 重复读到）
@@ -2754,6 +2775,32 @@ class NapCatWSChannel(BaseChannel):
         if fexp is None or not getattr(fexp, "items", None):
             return []
 
+        # 关键修复：合并转发节点里的图片也要下载到本地，让大模型可见。
+        # NapCat get_forward_msg 返回的节点消息在 expand_forward 中已被 parser_v2 解析，
+        # 这里复用其 media_meta（只包含 https 图片 url + file/name）。
+        forward_media_meta = list(getattr(fexp, "media_meta", None) or [])
+        if forward_media_meta:
+            try:
+                # 直接走与普通消息同一套下载器：构造最小 segments 供 _extract_https_image_items 识别。
+                fake_message: list[dict[str, Any]] = []
+                for m in forward_media_meta:
+                    if not isinstance(m, dict):
+                        continue
+                    if str(m.get("type") or "") != "image":
+                        continue
+                    url = str(m.get("url") or "").strip()
+                    name = str(m.get("file") or "").strip()
+                    if not url or not name:
+                        continue
+                    fake_message.append({"type": "image", "data": {"url": url, "file": name}})
+
+                forward_paths = await self._download_images_from_message(fake_message)
+            except Exception as exc:
+                logger.debug("napcat_ws forward image download failed: {}", exc)
+                forward_paths = []
+        else:
+            forward_paths = []
+
         items: list[dict[str, Any]] = []
         for item in fexp.items:
             if not isinstance(item, dict):
@@ -2765,7 +2812,9 @@ class NapCatWSChannel(BaseChannel):
                     "time": None,
                     "text": str(item.get("m") or ""),
                     "media": [],
-                    "media_paths": [],
+                    # 注意：这里把转发节点的图片路径挂在每个 item 上不准确（我们没做 per-node 对齐），
+                    # 但 napcat_ws 主链路只需要“把图片喂给大模型”，因此先把全部 forward_paths 统一附上。
+                    "media_paths": list(forward_paths),
                     "media_meta": [],
                     "message": None,
                     "raw_message": None,
