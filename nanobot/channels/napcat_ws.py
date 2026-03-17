@@ -34,20 +34,27 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
 import re
-import os
 import shutil
-from collections import deque, OrderedDict
+import time
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
-import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Deque, Dict, Literal, Optional
 from urllib.parse import urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 from loguru import logger
+from pydantic import Field
+
+from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.queue import MessageBus
+from nanobot.channels.base import BaseChannel
+from nanobot.config.paths import get_media_dir
+from nanobot.config.schema import Base
 
 
 def summarize_onebot_event(payload: dict[str, Any]) -> str:
