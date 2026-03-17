@@ -1891,15 +1891,16 @@ def _probability_for_message(
     return float(getattr(config, "group_trigger_probability", 0.0) or 0.0), "group_probability"
 
 
-def decide_message_trigger(
-    msg: NormalizedInbound,
-    *,
-    config: NapCatWSConfig,
-    store: V2SessionStore,
-    session_key: str,
-    self_id: str,
-) -> TriggerDecision:
-    """决定 message 事件是否触发回复。"""
+def _message_probability_seed(msg: NormalizedInbound, *, session_key: str) -> str:
+    """构造 message 概率触发使用的稳定 seed。"""
+
+    return f"{session_key}|{msg.message_id}|{msg.sender_id}|{msg.timestamp.timestamp()}"
+
+
+def _check_message_source_gate(
+    msg: NormalizedInbound, *, config: NapCatWSConfig, self_id: str
+) -> TriggerDecision | None:
+    """执行 message 来源侧门禁；放行时返回 None。"""
 
     if not _is_allowed_source(msg, config):
         return TriggerDecision(False, "not_allowed")
@@ -1911,11 +1912,24 @@ def decide_message_trigger(
         blk = set(str(x) for x in (getattr(config, "blacklist_private_ids", []) or []))
         if str(msg.chat.chat_id) in blk or str(msg.sender_id) in blk:
             return TriggerDecision(False, "blacklist_private")
-    else:
-        blk = set(str(x) for x in (getattr(config, "blacklist_group_ids", []) or []))
-        gid = str(msg.chat.group_id or msg.chat.chat_id)
-        if gid in blk:
-            return TriggerDecision(False, "blacklist_group")
+        return None
+
+    blk = set(str(x) for x in (getattr(config, "blacklist_group_ids", []) or []))
+    gid = str(msg.chat.group_id or msg.chat.chat_id)
+    if gid in blk:
+        return TriggerDecision(False, "blacklist_group")
+    return None
+
+
+def _check_message_direct_trigger(
+    msg: NormalizedInbound,
+    *,
+    config: NapCatWSConfig,
+    store: V2SessionStore,
+    session_key: str,
+    self_id: str,
+) -> TriggerDecision | None:
+    """执行 message 直接触发检查；未命中时返回 None。"""
 
     if (
         msg.chat.chat_type == "group"
@@ -1933,6 +1947,14 @@ def decide_message_trigger(
     if nicknames and _contains_any(msg.text, nicknames):
         return TriggerDecision(True, "nickname", "nickname")
 
+    return None
+
+
+def _decide_message_probability_trigger(
+    msg: NormalizedInbound, *, config: NapCatWSConfig, session_key: str
+) -> TriggerDecision:
+    """执行 message 概率触发决策。"""
+
     if not _message_has_content(msg):
         return TriggerDecision(False, "no_content")
 
@@ -1942,8 +1964,7 @@ def decide_message_trigger(
     if probability >= 1.0:
         return TriggerDecision(True, "probability=1", trigger, probability)
 
-    seed = f"{session_key}|{msg.message_id}|{msg.sender_id}|{msg.timestamp.timestamp()}"
-    sample = _stable_random_0_1(seed)
+    sample = _stable_random_0_1(_message_probability_seed(msg, session_key=session_key))
     if sample < probability:
         return TriggerDecision(
             True, f"probability({sample:.3f}<{probability:.3f})", trigger, probability
@@ -1951,6 +1972,33 @@ def decide_message_trigger(
     return TriggerDecision(
         False, f"probability({sample:.3f}>={probability:.3f})", trigger, probability
     )
+
+
+def decide_message_trigger(
+    msg: NormalizedInbound,
+    *,
+    config: NapCatWSConfig,
+    store: V2SessionStore,
+    session_key: str,
+    self_id: str,
+) -> TriggerDecision:
+    """决定 message 事件是否触发回复。"""
+
+    gate = _check_message_source_gate(msg, config=config, self_id=self_id)
+    if gate is not None:
+        return gate
+
+    direct = _check_message_direct_trigger(
+        msg,
+        config=config,
+        store=store,
+        session_key=session_key,
+        self_id=self_id,
+    )
+    if direct is not None:
+        return direct
+
+    return _decide_message_probability_trigger(msg, config=config, session_key=session_key)
 
 
 def decide_notice_trigger(
