@@ -168,12 +168,6 @@ class NapCatWSConfig(Base):
         description="忽略机器人自身消息，避免自回声 / 死循环",
     )
 
-    # --- 多轮回复 ---
-    multi_turn_max_replies: int = Field(
-        default=3,
-        description="一次多轮回复最多连续发送的条数",
-    )
-
 
 # NOTE: transport 层也会用到 OneBot action 常量（get_login_info）
 
@@ -220,9 +214,6 @@ V2_FORWARD_CACHE_MAXSIZE = 1024
 
 
 TRUNCATION_TAG = "<TRUNCATED>"  # 固定截断标记
-NO_REPLY_TAG = "<NO_REPLY>"  # 主回复不发送
-NO_FOLLOWUP_TAG = "<NO_FOLLOWUP>"  # 不继续 follow-up
-
 
 @dataclass(slots=True)
 class CQCtxReverseMap:
@@ -2224,9 +2215,6 @@ class NapCatWSChannel(BaseChannel):
         )
         self._context_builder = NapCatContextBuilder()
 
-        # 多次回复（multi-turn follow-up）任务容器：保留该能力，具体调度逻辑后续实现。
-        self._followup_tasks: dict[str, asyncio.Task[None]] = {}
-
         # 戳一戳(poke) 冷却：key 为 "{chat_type}:{chat_id}"，value 为上次触发时间戳(time.time())。
         # 该冷却只用于 notice(poke) 链路，避免被连续戳导致刷屏。
         self._poke_last_ts_by_chat: dict[str, float] = {}
@@ -2343,10 +2331,6 @@ class NapCatWSChannel(BaseChannel):
         self._running = False
         logger.info("{} stopping", self.name)
 
-        for task in list(self._followup_tasks.values()):
-            task.cancel()
-        self._followup_tasks.clear()
-
         await self._transport.stop()
 
     def _normalize_outbound_cq_images(self, text: str) -> str:
@@ -2431,13 +2415,6 @@ class NapCatWSChannel(BaseChannel):
 
         content = str(msg.content or "")
         content = self._normalize_outbound_cq_images(content)
-
-        # 最后一层保险：绝不把控制标签发到群里/私聊里。
-        if NO_REPLY_TAG in content:
-            return
-        if content:
-            content = content.replace(NO_FOLLOWUP_TAG, "")
-            content = content.strip()
 
         if not content.strip() and not msg.media:
             return
