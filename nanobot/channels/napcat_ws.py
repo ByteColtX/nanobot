@@ -1421,7 +1421,7 @@ class NapCatTransport:
                         if not isinstance(payload, dict):
                             continue
                     except Exception as e:
-                        logger.warning("napcat_ws transport: invalid frame: {}", e)
+                        logger.warning("napcat_ws transport invalid_frame err={}", e)
                         continue
 
                     # 1) action_response：优先按旧实现识别（status+retcode），避免被当作普通事件分发。
@@ -1432,7 +1432,7 @@ class NapCatTransport:
                             fut = self._pending.pop(key, None)
                             if fut is not None and not fut.done():
                                 logger.debug(
-                                    "napcat_ws action recv: echo={} status={} retcode={}",
+                                    "napcat_ws action_recv echo={} status={} retcode={}",
                                     key,
                                     payload.get("status"),
                                     payload.get("retcode"),
@@ -1440,7 +1440,7 @@ class NapCatTransport:
                                 fut.set_result(payload)
                         else:
                             logger.debug(
-                                "napcat_ws transport: action response missing echo: keys={}",
+                                "napcat_ws transport action_missing_echo keys={}",
                                 sorted(payload.keys()),
                             )
                         continue
@@ -1460,7 +1460,7 @@ class NapCatTransport:
             except Exception as e:
                 if not self._running:
                     break
-                logger.warning("napcat_ws transport error: {} (reconnect in {}s)", e, backoff_s)
+                logger.warning("napcat_ws transport reconnect err={} backoff_s={}", e, backoff_s)
                 await asyncio.sleep(backoff_s)
                 backoff_s = min(backoff_s * 2.0, 30.0)
             finally:
@@ -1541,7 +1541,7 @@ class NapCatTransport:
             except asyncio.CancelledError:
                 return
             except Exception:
-                logger.exception("napcat_ws transport: on_event task failed: {}", summary)
+                logger.exception("napcat_ws transport on_event_failed summary={}", summary)
 
         task.add_done_callback(_done)
 
@@ -1575,11 +1575,11 @@ class NapCatTransport:
                     uid = data.get("user_id")
                     nick = data.get("nickname")
                     if uid is not None:
-                        logger.info("napcat_ws login: user_id={} nickname={}", uid, nick)
+                        logger.info("napcat_ws login_info user_id={} nickname={}", uid, nick)
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.debug("napcat_ws get_login_info failed: {}", e)
+            logger.debug("napcat_ws login_info_failed err={}", e)
 
     async def call_action(
         self, action: str, params: dict[str, Any], timeout: float = 10.0
@@ -1599,7 +1599,7 @@ class NapCatTransport:
         self._pending[echo] = fut
 
         req = {"action": action, "params": params, "echo": echo}
-        logger.debug("napcat_ws action send: action={} echo={}", action, echo)
+        logger.debug("napcat_ws action_send action={} echo={}", action, echo)
         await self.send_json(req)
 
         try:
@@ -2339,14 +2339,14 @@ class NapCatWSChannel(BaseChannel):
             raise RuntimeError("websockets dependency is not installed")
 
         self._running = True
-        logger.info("{}: starting", self.name)
+        logger.info("{} starting", self.name)
         await self._transport.start()
 
     async def stop(self) -> None:
         """停止渠道。"""
 
         self._running = False
-        logger.info("{}: stopping", self.name)
+        logger.info("{} stopping", self.name)
 
         for task in list(self._followup_tasks.values()):
             task.cancel()
@@ -2481,13 +2481,13 @@ class NapCatWSChannel(BaseChannel):
         try:
             resp = await self._transport.call_action(action, params=params, timeout=10.0)
         except Exception as exc:
-            logger.debug("napcat_ws send failed: {}", exc)
+            logger.debug("napcat_ws send_failed err={}", exc)
             return
 
         # 记录平台返回的失败，避免“只看到告警但不知道为什么没发出去”。
         if not (isinstance(resp, dict) and resp.get("status") == "ok"):
             logger.warning(
-                "napcat_ws send not ok: action={} target={} resp={}",
+                "napcat_ws send_not_ok action={} target={} resp={}",
                 action,
                 params.get("group_id") or params.get("user_id") or "",
                 resp,
@@ -2557,7 +2557,7 @@ class NapCatWSChannel(BaseChannel):
             try:
                 await self._handle_notice(payload)
             except Exception:
-                logger.exception("napcat_ws notice handling failed: {}", summary)
+                logger.exception("napcat_ws notice_handling_failed summary={}", summary)
                 raise
             return
 
@@ -2568,7 +2568,7 @@ class NapCatWSChannel(BaseChannel):
         try:
             await self._handle_message(payload)
         except Exception:
-            logger.exception("napcat_ws message handling failed: {}", summary)
+            logger.exception("napcat_ws message_handling_failed summary={}", summary)
             raise
 
     # ------------------------------
@@ -2590,10 +2590,10 @@ class NapCatWSChannel(BaseChannel):
         # self_id 通常不变：避免 INFO 刷屏。
         # 首次设置仅用 DEBUG 记录；只有真的发生变化才 WARNING。
         if not old_sid:
-            logger.debug("napcat_ws self_id set from {}: {}", source, self._self_id)
+            logger.debug("napcat_ws self_id_set source={} self_id={}", source, self._self_id)
         else:
             logger.warning(
-                "napcat_ws self_id changed from {} to {} (source={})",
+                "napcat_ws self_id_changed old={} new={} source={}",
                 old_sid,
                 self._self_id,
                 source,
@@ -2653,7 +2653,7 @@ class NapCatWSChannel(BaseChannel):
             last_ts = float(self._poke_last_ts_by_chat.get(cooldown_key) or 0.0)
             if last_ts and (now_ts - last_ts) < float(cooldown_s):
                 logger.debug(
-                    "napcat_ws poke cooldown key={} remaining_lt={}s",
+                    "napcat_ws poke_cooldown key={} limit_s={}",
                     cooldown_key,
                     cooldown_s,
                 )
@@ -2936,7 +2936,7 @@ class NapCatWSChannel(BaseChannel):
                 pass
             self._store.append_message(session_key, context_line)
         except Exception as exc:
-            logger.debug("napcat_ws build context line failed: {}", exc)
+            logger.debug("napcat_ws build_context_line_failed err={}", exc)
 
     def _collect_visible_media(self, *, msg: NormalizedInbound, session_key: str) -> list[str]:
         # 关键修复：历史/引用/合并转发图片的可见性。
@@ -3082,7 +3082,7 @@ class NapCatWSChannel(BaseChannel):
                 fetch=lambda: self._detail_fetcher.expand_reply(message_id=rid, chat=msg.chat),
             )
         except Exception as exc:
-            logger.debug("napcat_ws quote expand failed: {}", exc)
+            logger.debug("napcat_ws quote_expand_failed err={}", exc)
             return
 
         if exp is None:
@@ -3146,7 +3146,7 @@ class NapCatWSChannel(BaseChannel):
                 fetch=lambda: self._detail_fetcher.expand_forward(forward_id=fid, chat=chat),
             )
         except Exception as exc:
-            logger.debug("napcat_ws forward fetch failed: {}", exc)
+            logger.debug("napcat_ws forward_fetch_failed err={}", exc)
             return []
 
         if fexp is None or not getattr(fexp, "items", None):
@@ -3173,7 +3173,7 @@ class NapCatWSChannel(BaseChannel):
 
                 forward_paths = await self._download_images_from_message(fake_message)
             except Exception as exc:
-                logger.debug("napcat_ws forward image download failed: {}", exc)
+                logger.debug("napcat_ws forward_image_download_failed err={}", exc)
                 forward_paths = []
         else:
             forward_paths = []
@@ -3368,7 +3368,7 @@ class NapCatWSChannel(BaseChannel):
                     part.unlink()
             except Exception:
                 pass
-            logger.debug("napcat_ws image download failed: url={} err={}", url, exc)
+            logger.debug("napcat_ws image_download_failed url={} err={}", url, exc)
             return False
 
     def _build_forward_summary(self, items: list[dict[str, Any]]) -> str:
