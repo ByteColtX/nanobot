@@ -237,8 +237,18 @@ TRUNCATION_TAG = "<TRUNCATED>"  # 固定截断标签：在 Prompt/Context 层前
 NO_REPLY_TAG = "<NO_REPLY>"  # 模型返回该标签表示不回复（channel 层应直接跳过发送）
 NO_FOLLOWUP_TAG = "<NO_FOLLOWUP>"  # 模型返回该标签表示不进行后续多次回复
 
-CONTEXT_BEGIN_TAG = "<NAPCAT_WS_CONTEXT>"  # 聊天上下文块开始标签（避免与 nanobot 其它标签冲突）
-CONTEXT_END_TAG = "</NAPCAT_WS_CONTEXT>"  # 聊天上下文块结束标签（避免与 nanobot 其它标签冲突）
+CONTEXT_BEGIN_TAG = "<NAPCAT_WS_CONTEXT>"  # 兼容保留：外围标签名不变，内部格式改为 CQCTX/3 / CQDM/1
+CONTEXT_END_TAG = "</NAPCAT_WS_CONTEXT>"  # 兼容保留：外围标签名不变，内部格式改为 CQCTX/3 / CQDM/1
+
+
+@dataclass(slots=True)
+class CQCtxReverseMap:
+    """短记号 -> 原始平台标识/文件名 的反向映射预留接口。"""
+
+    users: dict[str, dict[str, str]] = field(default_factory=dict)
+    images: dict[str, str] = field(default_factory=dict)
+    live_replies: dict[str, str] = field(default_factory=dict)
+    forward_node_replies: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -409,20 +419,12 @@ class ParsedMessage:
 
 @dataclass(slots=True)
 class ExpandedForward:
-    """合并转发（forward）的展开结果。
-
-    字段约定：
-      - id：forward id
-      - items：转发节点摘要列表（上下文友好）。为了省 token，节点只保留缩写字段：
-          {"u": "张三", "m": "好吃"}
-      - media_meta：转发节点中抽取的结构化媒体元数据（用于下载图片等），不进入上下文序列化。
-
-    注意：这里只定义数据结构；具体拉取(get_forward_msg)/解析/截断规则后续实现。
-    """ 
+    """合并转发（forward）的展开结果。"""
 
     id: str
-    items: list[dict[str, str]] = field(default_factory=list)
+    items: list[dict[str, Any]] = field(default_factory=list)
     media_meta: list[dict[str, Any]] = field(default_factory=list)
+    summary: str = ""
 
 
 @dataclass(slots=True)
@@ -455,35 +457,23 @@ class ExpandedReply:
 
 @dataclass(slots=True)
 class ContextMessageLine:
-    """<NAPCAT_WS_CONTEXT> 的单行消息（# Messages）结构。
-
-    为了省 token，字段名做了缩写（已定稿）：
-      - u：sender 显示名
-      - q：sender qq/user_id
-      - id：message_id
-      - m：类 CQ 字符串的消息内容（用于直接喂给模型）
-
-    可选展开字段：
-      - f：当本消息是 forward 时，附带已展开的转发节点列表（节点只保留 {"u","m"}）
-      - r：当本消息包含 reply 时，附带被引用的原消息（方案 A：{"u","m"}）
-
-    额外字段：
-      - media_paths：该条消息可用的本地图片文件路径列表（用于让大模型看见“历史图片”）。
-        注意：该字段不写入 <NAPCAT_WS_CONTEXT> 文本，只用于在本轮请求中合并到 InboundMessage.media。
-
-    注意：这里只定义数据结构；序列化/截断规则后续实现。
-    """
+    """规范化后的上下文消息行，供 CQCTX/3 与 CQDM/1 序列化。"""
 
     u: str
     q: str
     id: str
     m: str
 
-    # expansions (optional)
-    f: Optional[list[dict[str, str]]] = None
-    r: Optional[dict[str, str]] = None
+    # chat scope
+    chat_type: ChatType = "group"
+    group_id: str = ""
+    is_bot: bool = False
 
-    # local image paths (optional)
+    # expansions / structured refs
+    f: Optional[list[dict[str, Any]]] = None
+    r: Optional[dict[str, Any]] = None
+
+    # local image paths (not serialized into text context)
     media_paths: list[str] = field(default_factory=list)
 
 
@@ -505,7 +495,290 @@ def _json_dumps_compact(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
-class InMemoryMessageCache:
+def _cqctx_escape(text: str) -> str:
+    s = str(text or "")
+    s = s.replace("\\", "\\\\")
+    s = s.replace("|", "\\|")
+    s = s.replace("\n", "\\n")
+    return s
+
+
+def _cqctx_filename_from_path(path: str) -> str:
+    try:
+        return _safe_media_filename(Path(str(path or "")).name)
+    except Exception:
+        return ""
+
+
+class _CQCtxSymbolTable:
+    def __init__(self) -> None:
+        self.user_by_qq: dict[str, str] = {}
+        self.user_rows: list[dict[str, Any]] = []
+        self.image_by_name: dict[str, str] = {}
+        self.image_rows: list[dict[str, str]] = []
+        self.forward_counter = 0
+        self.reverse = CQCtxReverseMap()
+
+    def user_ref(self, *, qq: str, name: str, is_bot: bool = False) -> str:
+        qq_s = str(qq or "").strip()
+        if not qq_s:
+            qq_s = "0"
+        ref = self.user_by_qq.get(qq_s)
+        if ref is not None:
+            if is_bot:
+                self.reverse.users.setdefault(ref, {}).update({"qq": qq_s, "name": str(name or qq_s), "bot": "1"})
+            return ref
+        ref = f"u{len(self.user_rows)}"
+        row = {"ref": ref, "qq": qq_s, "name": str(name or qq_s), "bot": bool(is_bot)}
+        self.user_by_qq[qq_s] = ref
+        self.user_rows.append(row)
+        self.reverse.users[ref] = {"qq": qq_s, "name": str(name or qq_s), "bot": "1" if is_bot else "0"}
+        return ref
+
+    def image_ref(self, filename: str) -> str:
+        safe = _safe_media_filename(filename)
+        if not safe:
+            safe = "unknown"
+        ref = self.image_by_name.get(safe)
+        if ref is not None:
+            return ref
+        ref = f"i{len(self.image_rows)}"
+        self.image_by_name[safe] = ref
+        self.image_rows.append({"ref": ref, "filename": safe})
+        self.reverse.images[ref] = safe
+        return ref
+
+    def new_forward_ref(self) -> str:
+        ref = f"f{self.forward_counter}"
+        self.forward_counter += 1
+        return ref
+
+
+class _CQCtxBodyEncoder:
+    _token_re = re.compile(r"\[CQ:([^,\]]+)(?:,([^\]]+))?\]")
+
+    def __init__(self, *, symbols: _CQCtxSymbolTable, is_group: bool) -> None:
+        self.symbols = symbols
+        self.is_group = bool(is_group)
+
+    def encode(self, text: str, *, node_ref_map: Optional[dict[str, str]] = None) -> str:
+        src = str(text or "")
+        if not src:
+            return ""
+        out: list[str] = []
+        pos = 0
+        for m in self._token_re.finditer(src):
+            if m.start() > pos:
+                out.append(_cqctx_escape(src[pos:m.start()]))
+            typ = str(m.group(1) or "").strip().lower()
+            params = _parse_cq_params(m.group(2) or "")
+            out.append(self._map_token(typ, params, node_ref_map=node_ref_map))
+            pos = m.end()
+        if pos < len(src):
+            out.append(_cqctx_escape(src[pos:]))
+        return "".join(out).strip()
+
+    def _map_token(self, typ: str, params: dict[str, str], *, node_ref_map: Optional[dict[str, str]]) -> str:
+        if typ == "at":
+            qq = str(params.get("qq") or "").strip()
+            if not qq:
+                return ""
+            ref = self.symbols.user_ref(qq=qq, name=qq)
+            return f"@{ref}"
+        if typ == "reply":
+            rid = str(params.get("id") or params.get("message_id") or "").strip()
+            if not rid:
+                return ""
+            if node_ref_map and rid in node_ref_map:
+                self.symbols.reverse.forward_node_replies[node_ref_map[rid]] = rid
+                return f">n:{node_ref_map[rid]}"
+            self.symbols.reverse.live_replies[rid] = rid
+            return f">m:{rid}"
+        if typ == "image":
+            filename = str(params.get("file") or params.get("name") or "").strip()
+            if filename.startswith("file://"):
+                filename = _cqctx_filename_from_path(filename)
+            else:
+                filename = _safe_media_filename(filename)
+            ref = self.symbols.image_ref(filename)
+            return f"[{ref}]"
+        if typ == "forward":
+            return ""
+        if typ in {"record", "video", "file", "face"}:
+            return f"[{typ}]"
+        return _cqctx_escape(f"[CQ:{typ}]")
+
+
+class NapCatContextBuilderV2Impl:
+    """V2 上下文构建器：输出紧凑的 CQCTX/3（群）或 CQDM/1（私聊）。"""
+
+    def build(
+        self,
+        *,
+        chat: ChatRef,
+        bot_name: str,
+        bot_id: str,
+        time_window_label: str,
+        prompts: list[str],
+        messages: list[ContextMessageLine],
+    ) -> str:
+        if chat.chat_type == "private":
+            return self._build_dm(chat=chat, bot_name=bot_name, bot_id=bot_id, messages=messages)
+        return self._build_group(chat=chat, bot_name=bot_name, bot_id=bot_id, messages=messages)
+
+    def build_reverse_map(
+        self,
+        *,
+        chat: ChatRef,
+        bot_name: str,
+        bot_id: str,
+        messages: list[ContextMessageLine],
+    ) -> CQCtxReverseMap:
+        symbols = self._collect_symbols(chat=chat, bot_name=bot_name, bot_id=bot_id, messages=messages)
+        return symbols.reverse
+
+    def _build_group(self, *, chat: ChatRef, bot_name: str, bot_id: str, messages: list[ContextMessageLine]) -> str:
+        symbols = self._collect_symbols(chat=chat, bot_name=bot_name, bot_id=bot_id, messages=messages)
+        bot_ref = symbols.user_ref(qq=str(bot_id or "0"), name=str(bot_name or bot_id or "bot"), is_bot=True)
+        rows: list[str] = [f"<CQCTX/3 g:{_cqctx_escape(chat.chat_id)} bot:{bot_ref} n:{len(messages)}>" ]
+        for row in symbols.user_rows:
+            suffix = "|bot" if row.get("bot") else ""
+            rows.append(f"U|{row['ref']}|{_cqctx_escape(row['qq'])}|{_cqctx_escape(row['name'])}{suffix}")
+        for row in symbols.image_rows:
+            rows.append(f"I|{row['ref']}|{_cqctx_escape(row['filename'])}")
+        encoder = _CQCtxBodyEncoder(symbols=symbols, is_group=True)
+        rows.extend(self._serialize_messages(messages=messages, symbols=symbols, encoder=encoder, private_mode=False, bot_id=str(bot_id or ""), bot_name=str(bot_name or bot_id or "bot"), chat=chat))
+        rows.append("</CQCTX/3>")
+        return "\n".join(rows)
+
+    def _build_dm(self, *, chat: ChatRef, bot_name: str, bot_id: str, messages: list[ContextMessageLine]) -> str:
+        symbols = self._collect_symbols(chat=chat, bot_name=bot_name, bot_id=bot_id, messages=messages)
+        peer_name = str(chat.user_id or "peer")
+        for m in messages:
+            if str(m.q or "") == str(chat.user_id or "") and str(m.u or "").strip():
+                peer_name = str(m.u)
+                break
+        rows: list[str] = [f"<CQDM/1 n:{len(messages)}>" ]
+        rows.append(f"P|me|{_cqctx_escape(str(bot_id or ''))}|{_cqctx_escape(str(bot_name or bot_id or 'bot'))}|bot")
+        rows.append(f"P|peer|{_cqctx_escape(str(chat.user_id or chat.chat_id or ''))}|{_cqctx_escape(peer_name)}")
+        for row in symbols.user_rows:
+            qq_s = str(row.get("qq") or "")
+            if qq_s in {str(bot_id or ""), str(chat.user_id or chat.chat_id or "")}:
+                continue
+            suffix = "|bot" if row.get("bot") else ""
+            rows.append(f"U|{row['ref']}|{_cqctx_escape(row['qq'])}|{_cqctx_escape(row['name'])}{suffix}")
+        for row in symbols.image_rows:
+            rows.append(f"I|{row['ref']}|{_cqctx_escape(row['filename'])}")
+        encoder = _CQCtxBodyEncoder(symbols=symbols, is_group=False)
+        rows.extend(self._serialize_messages(messages=messages, symbols=symbols, encoder=encoder, private_mode=True, bot_id=str(bot_id or ""), bot_name=str(bot_name or bot_id or "bot"), chat=chat))
+        rows.append("</CQDM/1>")
+        return "\n".join(rows)
+
+    def _collect_symbols(self, *, chat: ChatRef, bot_name: str, bot_id: str, messages: list[ContextMessageLine]) -> _CQCtxSymbolTable:
+        symbols = _CQCtxSymbolTable()
+        if chat.chat_type == "group":
+            symbols.user_ref(qq=str(bot_id or "0"), name=str(bot_name or bot_id or "bot"), is_bot=True)
+        else:
+            symbols.user_ref(qq=str(bot_id or "0"), name=str(bot_name or bot_id or "bot"), is_bot=True)
+            symbols.user_ref(qq=str(chat.user_id or chat.chat_id or "peer"), name=str(chat.user_id or chat.chat_id or "peer"))
+        for line in messages:
+            symbols.user_ref(qq=str(line.q or "0"), name=str(line.u or line.q or "unknown"), is_bot=bool(line.is_bot))
+            self._collect_line_assets(line=line, symbols=symbols)
+        return symbols
+
+    def _collect_line_assets(self, *, line: ContextMessageLine, symbols: _CQCtxSymbolTable) -> None:
+        self._collect_images_from_text(line.m, symbols)
+        if isinstance(line.r, dict):
+            qq = str(line.r.get("q") or "").strip()
+            name = str(line.r.get("u") or qq or "unknown")
+            if qq:
+                symbols.user_ref(qq=qq, name=name, is_bot=bool(line.r.get("bot")))
+            self._collect_images_from_text(str(line.r.get("m") or ""), symbols)
+        for p in list(getattr(line, "media_paths", None) or []):
+            fn = _cqctx_filename_from_path(p)
+            if fn:
+                symbols.image_ref(fn)
+        for node in list(line.f or []):
+            if not isinstance(node, dict):
+                continue
+            qq = str(node.get("q") or "").strip()
+            name = str(node.get("u") or qq or "unknown")
+            if qq:
+                symbols.user_ref(qq=qq, name=name, is_bot=bool(node.get("bot")))
+            self._collect_images_from_text(str(node.get("m") or ""), symbols)
+            for p in list(node.get("media_paths") or []):
+                fn = _cqctx_filename_from_path(p)
+                if fn:
+                    symbols.image_ref(fn)
+
+    def _collect_images_from_text(self, text: str, symbols: _CQCtxSymbolTable) -> None:
+        for m in _CQCtxBodyEncoder._token_re.finditer(str(text or "")):
+            typ = str(m.group(1) or "").strip().lower()
+            if typ != "image":
+                continue
+            params = _parse_cq_params(m.group(2) or "")
+            filename = str(params.get("file") or params.get("name") or "").strip()
+            if filename.startswith("file://"):
+                filename = _cqctx_filename_from_path(filename)
+            else:
+                filename = _safe_media_filename(filename)
+            if filename:
+                symbols.image_ref(filename)
+
+    def _serialize_messages(self, *, messages: list[ContextMessageLine], symbols: _CQCtxSymbolTable, encoder: _CQCtxBodyEncoder, private_mode: bool, bot_id: str, bot_name: str, chat: ChatRef) -> list[str]:
+        rows: list[str] = []
+        for line in messages:
+            sender_ref = self._sender_ref(line=line, symbols=symbols, private_mode=private_mode, bot_id=bot_id, peer_id=str(chat.user_id or chat.chat_id or ""))
+            body = encoder.encode(line.m)
+            forward_rows: list[str] = []
+            if line.f:
+                fid = symbols.new_forward_ref()
+                if body:
+                    body = f"{body} [F:{fid}]".strip()
+                else:
+                    body = f"[F:{fid}]"
+                summary = str((line.r or {}).get("forward_summary") or "").strip() if isinstance(line.r, dict) else ""
+                if not summary:
+                    summary = str(getattr(line, "forward_summary", "") or "").strip()
+                summary_part = f"|{_cqctx_escape(summary)}" if summary else ""
+                forward_rows.append(f"F|{fid}|{len(line.f)}{summary_part}")
+                node_ref_map: dict[str, str] = {}
+                for idx, node in enumerate(line.f):
+                    node_ref = f"{fid}.{idx}"
+                    node_msg_id = str(node.get("id") or "").strip()
+                    if node_msg_id:
+                        node_ref_map[node_msg_id] = node_ref
+                for idx, node in enumerate(line.f):
+                    node_ref = f"{fid}.{idx}"
+                    node_sender = self._node_sender_ref(node=node, symbols=symbols, private_mode=private_mode, bot_id=bot_id, peer_id=str(chat.user_id or chat.chat_id or ""))
+                    node_body = encoder.encode(str(node.get("m") or ""), node_ref_map=node_ref_map)
+                    if private_mode:
+                        src = str(node.get("src") or "").strip()
+                        src_part = f"|{_cqctx_escape(src)}" if src else ""
+                        forward_rows.append(f"N|{node_ref}|{node_sender}{src_part}|{node_body}")
+                    else:
+                        forward_rows.append(f"N|{node_ref}|{node_sender}|{node_body}")
+            rows.append(f"M|{_cqctx_escape(line.id)}|{sender_ref}|{body}")
+            rows.extend(forward_rows)
+        return rows
+
+    def _sender_ref(self, *, line: ContextMessageLine, symbols: _CQCtxSymbolTable, private_mode: bool, bot_id: str, peer_id: str) -> str:
+        qq = str(line.q or "")
+        if private_mode:
+            if qq == str(bot_id or ""):
+                return "me"
+            if qq == str(peer_id or ""):
+                return "peer"
+        return symbols.user_ref(qq=qq, name=str(line.u or qq or "unknown"), is_bot=bool(line.is_bot))
+
+    def _node_sender_ref(self, *, node: dict[str, Any], symbols: _CQCtxSymbolTable, private_mode: bool, bot_id: str, peer_id: str) -> str:
+        qq = str(node.get("q") or "")
+        if private_mode:
+            if qq == str(bot_id or ""):
+                return "me"
+            if qq == str(peer_id or ""):
+                return "peer"
+        return symbols.user_ref(qq=qq, name=str(node.get("u") or qq or "unknown"), is_bot=bool(node.get("bot")))
     """进程内存缓存（最小可用版）。
 
     目标：
@@ -952,7 +1225,7 @@ class NapCatMessageDetailFetcherV2:
         if not isinstance(nodes, list):
             return ExpandedForward(id=fid)
 
-        items: list[dict[str, str]] = []
+        items: list[dict[str, Any]] = []
         media_meta: list[dict[str, Any]] = []
         for node in nodes:
             if isinstance(node, str):
@@ -967,8 +1240,7 @@ class NapCatMessageDetailFetcherV2:
                         limit = 0
                     if limit > 0 and len(m) > limit:
                         m = m[:limit] + TRUNCATION_TAG
-                items.append({"u": "unknown", "m": m})
-                # 尝试从 CQ 字符串解析图片（https url）
+                items.append({"u": "unknown", "q": "", "id": "", "m": m, "src": ""})
                 if parsed.media_meta:
                     media_meta.extend(list(parsed.media_meta))
                 continue
@@ -981,6 +1253,11 @@ class NapCatMessageDetailFetcherV2:
                 sender = {}
             uid = str(node.get("user_id") or sender.get("user_id") or "").strip()
             u = str(sender.get("card") or sender.get("nickname") or uid or "unknown").strip()
+            src = ""
+            if chat.chat_type == "private":
+                gid = str(node.get("group_id") or "").strip()
+                if gid:
+                    src = f"g:{gid}"
 
             payload_like = {
                 "message": node.get("message"),
@@ -996,11 +1273,22 @@ class NapCatMessageDetailFetcherV2:
                 limit = 0
             if limit > 0 and len(m) > limit:
                 m = m[:limit] + TRUNCATION_TAG
-            items.append({"u": u, "m": m})
+            items.append({
+                "u": u,
+                "q": uid,
+                "id": str(node.get("message_id") or "").strip(),
+                "m": m,
+                "src": src,
+            })
             if parsed.media_meta:
                 media_meta.extend(list(parsed.media_meta))
 
-        return ExpandedForward(id=fid, items=items, media_meta=media_meta)
+        summary = ""
+        try:
+            summary = str(data.get("summary") or data.get("prompt") or "").strip()
+        except Exception:
+            summary = ""
+        return ExpandedForward(id=fid, items=items, media_meta=media_meta, summary=summary)
 
 
 
@@ -2188,6 +2476,9 @@ class NapCatWSChannel(BaseChannel):
                                 q=str(self._self_id or ""),
                                 id=str(mid),
                                 m=str(content),
+                                chat_type=str(msg.metadata.get("chat_type") or "group"),
+                                group_id=str(msg.metadata.get("group_id") or ""),
+                                is_bot=True,
                             ),
                         )
         except Exception:
@@ -2351,6 +2642,9 @@ class NapCatWSChannel(BaseChannel):
                 q=str(actor),
                 id=event_id,
                 m=poke_text,
+                chat_type=chat.chat_type,
+                group_id=str(group_id or ""),
+                is_bot=False,
             ),
         )
 
@@ -2544,6 +2838,9 @@ class NapCatWSChannel(BaseChannel):
             q=str(msg.sender_id or ""),
             id=str(msg.message_id or ""),
             m=m,
+            chat_type=msg.chat.chat_type,
+            group_id=str(msg.chat.group_id or ""),
+            is_bot=(str(msg.sender_id or "") == str(self._self_id or "")),
         )
 
         # reply 展开：优先复用现有 msg.reply（已 expand_quote），否则走 cache+fetcher
@@ -2564,7 +2861,13 @@ class NapCatWSChannel(BaseChannel):
                 qm = self._truncate_user_text(qm_raw)
                 qu = str(msg.reply.sender_name or msg.reply.sender_id or "unknown")
                 if qu and qm:
-                    line.r = {"u": qu, "m": qm}
+                    line.r = {
+                        "u": qu,
+                        "q": str(msg.reply.sender_id or ""),
+                        "m": qm,
+                        "id": str(msg.reply.message_id or rid),
+                        "bot": (str(msg.reply.sender_id or "") == str(self._self_id or "")),
+                    }
             else:
                 try:
                     exp = await self._cache_v2.get_or_fetch_reply(
@@ -2575,7 +2878,13 @@ class NapCatWSChannel(BaseChannel):
                     exp = None
 
                 if exp is not None and str(exp.u or "").strip() and str(exp.m or "").strip():
-                    line.r = {"u": str(exp.u), "m": self._truncate_user_text(str(exp.m))}
+                    line.r = {
+                        "u": str(exp.u),
+                        "q": str(exp.q or ""),
+                        "m": self._truncate_user_text(str(exp.m)),
+                        "id": rid,
+                        "bot": (str(exp.q or "") == str(self._self_id or "")),
+                    }
 
         # forward 展开：优先复用现有 msg.forward_items（已 expand_forward），否则走 cache+fetcher
         fid = str(parsed.forward_id or "").strip()
@@ -2585,11 +2894,12 @@ class NapCatWSChannel(BaseChannel):
         if fid:
             # 如果 normalize/expand 已经拿到 forward_items，我们优先把它们转成 V2 的 {u,m}，避免重复 action
             if msg.forward_items:
-                items_v2: list[dict[str, str]] = []
+                items_v2: list[dict[str, Any]] = []
                 for it in msg.forward_items:
                     if not isinstance(it, dict):
                         continue
                     u2 = str(it.get("sender_name") or it.get("sender_id") or "unknown")
+                    q2 = str(it.get("sender_id") or "").strip()
 
                     payload_like_node = {
                         "message": it.get("message"),
@@ -2599,15 +2909,21 @@ class NapCatWSChannel(BaseChannel):
                     parsed_node = self._parser_v2.parse(payload=payload_like_node, self_id=str(self._self_id or ""))
                     t2 = str(parsed_node.cq_text or "").strip()
                     if not t2:
-                        # 兜底：退回旧 pipeline 的 rendered_text（仍可能包含占位符）
                         t2 = str(it.get("text") or "").strip()
 
                     t2 = self._truncate_user_text(t2)
 
                     if t2:
-                        items_v2.append({"u": u2, "m": t2})
+                        items_v2.append({
+                            "u": u2,
+                            "q": q2,
+                            "id": str(it.get("message_id") or "").strip(),
+                            "m": t2,
+                            "src": str(it.get("src") or "").strip(),
+                            "media_paths": list(it.get("media_paths") or []),
+                        })
 
-                fexp = ExpandedForward(id=fid, items=items_v2)
+                fexp = ExpandedForward(id=fid, items=items_v2, summary=str(msg.forward_summary or ""))
                 # 写入 cache，避免后续重复
                 try:
                     self._cache_v2.put_forward(fid, fexp)
@@ -2629,14 +2945,13 @@ class NapCatWSChannel(BaseChannel):
 
     def _build_chat_context_v2(self, *, msg: NormalizedInbound, session_key: str, bot_name: str) -> str:
         hist_limit = int(getattr(self.config, "context_max_messages", 20) or 20)
-        time_window_label = f"latest_{hist_limit}"
         hist = self._store.recent_messages(session_key, hist_limit)
 
         return self._ctx_builder_v2.build(
             chat=msg.chat,
             bot_name=str(bot_name or ""),
             bot_id=str(self._self_id or ""),
-            time_window_label=time_window_label,
+            time_window_label=f"latest_{hist_limit}",
             prompts=[],
             messages=hist,
         )
@@ -2946,15 +3261,15 @@ class NapCatWSChannel(BaseChannel):
                 {
                     "sender_id": str(item.get("q") or ""),
                     "sender_name": str(item.get("u") or item.get("q") or "unknown"),
+                    "message_id": str(item.get("id") or "").strip(),
                     "time": None,
                     "text": str(item.get("m") or ""),
                     "media": [],
-                    # 注意：这里把转发节点的图片路径挂在每个 item 上不准确（我们没做 per-node 对齐），
-                    # 但 napcat_ws 主链路只需要“把图片喂给大模型”，因此先把全部 forward_paths 统一附上。
                     "media_paths": list(forward_paths),
                     "media_meta": [],
                     "message": None,
                     "raw_message": None,
+                    "src": str(item.get("src") or "").strip(),
                 }
             )
         return items
