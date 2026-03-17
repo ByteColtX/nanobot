@@ -1955,6 +1955,67 @@ class NapCatWSChannel(BaseChannel):
 
         await self._transport.stop()
 
+    def _normalize_outbound_cq_images(self, text: str) -> str:
+        """尽量把模型生成的 CQ:image 参数规范化成 NapCat/OneBot 更可能接受的形式。
+
+        仅处理一种场景：
+        - [CQ:image,file=xxxxx.jpg] 这种 *非 URI* 的 file 参数。
+
+        处理策略：
+        - 若 file 不是 URI（不以 file:// / http(s):// / base64:// 开头），则视为“本地路径或文件名”
+        - 如果是相对路径/文件名，则默认在本 channel 的 media 目录下查找
+        - 找到真实文件后改写为 file:// 绝对路径
+
+        注意：这里不做 fallback（例如把 group_id 当 chat_id），也不猜测远端路径。
+        """
+
+        s = str(text or "")
+        if "[CQ:" not in s:
+            return s
+
+        out: list[str] = []
+        pos = 0
+        for m in _CQ_OUTBOUND_RE.finditer(s):
+            out.append(s[pos : m.start()])
+
+            cq_text = m.group(0)
+            cq_type = str(m.group(1) or "").strip().lower()
+            params_raw = m.group(2) or ""
+
+            if cq_type != "image":
+                out.append(cq_text)
+                pos = m.end()
+                continue
+
+            params = _parse_cq_params(params_raw)
+            file_val = str(params.get("file") or "").strip()
+
+            # 已经是 URI（或 base64）则不动
+            lower = file_val.lower()
+            if not file_val or lower.startswith("file://") or lower.startswith("http://") or lower.startswith("https://") or lower.startswith("base64://"):
+                out.append(cq_text)
+                pos = m.end()
+                continue
+
+            p = Path(os.path.expanduser(file_val))
+            if not p.is_absolute():
+                p = self._media_dir / file_val
+
+            try:
+                if p.exists() and p.is_file():
+                    params["file"] = f"file://{p.resolve()}"
+                    params_str = ",".join(f"{k}={v}" for k, v in params.items() if k)
+                    out.append(f"[CQ:image,{params_str}]")
+                else:
+                    out.append(cq_text)
+            except Exception:
+                out.append(cq_text)
+
+            pos = m.end()
+
+        out.append(s[pos:])
+        return "".join(out)
+
     async def send(self, msg: OutboundMessage) -> None:
         """从 MessageBus 收到 OutboundMessage 后，发送到平台。
 
@@ -1969,6 +2030,7 @@ class NapCatWSChannel(BaseChannel):
             return
 
         content = str(msg.content or "")
+        content = self._normalize_outbound_cq_images(content)
 
         # 最后一层保险：绝不把控制标签发到群里/私聊里。
         if NO_REPLY_TAG in content:
@@ -2015,6 +2077,16 @@ class NapCatWSChannel(BaseChannel):
             resp = await self._transport.call_action(action, params=params, timeout=10.0)
         except Exception as exc:
             logger.debug("napcat_ws send failed: {}", exc)
+            return
+
+        # 记录平台返回的失败，避免“只看到告警但不知道为什么没发出去”。
+        if not (isinstance(resp, dict) and resp.get("status") == "ok"):
+            logger.warning(
+                "napcat_ws send not ok: action={} target={} resp={}",
+                action,
+                params.get("group_id") or params.get("user_id") or "",
+                resp,
+            )
             return
 
         try:
