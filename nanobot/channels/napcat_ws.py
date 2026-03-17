@@ -348,6 +348,15 @@ class NormalizedInbound:
 
 
 @dataclass(slots=True)
+class PublishGateInput:
+    """Channel publish gate 输入。用于二次 publish 门禁，不参与 trigger 语义。"""
+
+    chat_type: ChatType
+    actor_id: str
+    group_id: str = ""
+
+
+@dataclass(slots=True)
 class TriggerDecision:
     """Policy 层的触发决策结果。"""
 
@@ -1990,6 +1999,48 @@ def decide_notice_trigger(
     return TriggerDecision(True, "poke", "poke")
 
 
+def _check_publish_gate(
+    gate: PublishGateInput,
+    *,
+    config: NapCatWSConfig,
+    channel_name: str,
+) -> tuple[bool, str | None]:
+    """检查 publish 前的二次门禁。
+
+    返回：
+    - (True, None): 允许继续 publish
+    - (False, reason): 拒绝 publish，reason 仅用于日志/调试
+
+    说明：
+    - 这不是 trigger policy；只是 channel 在真正 publish 给 agent 前的防御性 gate。
+    - 当前保留与既有行为一致的 allowFrom / blacklist 语义。
+    """
+
+    if gate.chat_type == "group":
+        gid = str(gate.group_id or "").strip()
+        blk_groups = set(str(x) for x in (getattr(config, "blacklist_group_ids", []) or []))
+        if gid and gid in blk_groups:
+            return False, "blacklist_group"
+    else:
+        actor = str(gate.actor_id or "").strip()
+        blk_priv = set(str(x) for x in (getattr(config, "blacklist_private_ids", []) or []))
+        if actor in blk_priv:
+            return False, "blacklist_private"
+
+    allow_list = [str(x) for x in (getattr(config, "allow_from", []) or []) if str(x).strip()]
+    if allow_list and "*" not in allow_list:
+        if gate.chat_type == "group":
+            gid = str(gate.group_id or "").strip()
+            if not gid or gid not in allow_list:
+                return False, f"allow_group_denied:{gid or '(empty)'}@{channel_name}"
+        else:
+            actor = str(gate.actor_id or "").strip()
+            if actor not in allow_list:
+                return False, f"allow_private_denied:{actor}@{channel_name}"
+
+    return True, None
+
+
 # =========================================
 # 4) Outbound validation helpers
 # =========================================
@@ -2668,45 +2719,32 @@ class NapCatWSChannel(BaseChannel):
         )
 
         # allowFrom 语义（NapCatWS 扩展）：支持 user_id 或 group_id（群聊只用 group_id，不做 fallback）
-        # 1) 黑名单优先
-        if chat.chat_type == "group":
-            gid = str(chat.group_id)
-            blk_groups = set(
-                str(x) for x in (getattr(self.config, "blacklist_group_ids", []) or [])
-            )
-            if gid and gid in blk_groups:
-                logger.debug("napcat_ws notice ignored: blacklist_group ({})", gid)
+        gate = PublishGateInput(
+            chat_type=chat.chat_type,
+            actor_id=str(actor),
+            group_id=str(chat.group_id),
+        )
+        allowed, reason = _check_publish_gate(gate, config=self.config, channel_name=self.name)
+        if not allowed:
+            if reason == "blacklist_group":
+                logger.debug("napcat_ws notice ignored: blacklist_group ({})", chat.group_id)
                 return
-        else:
-            blk_priv = set(
-                str(x) for x in (getattr(self.config, "blacklist_private_ids", []) or [])
-            )
-            if str(actor) in blk_priv:
+            if reason == "blacklist_private":
                 logger.debug("napcat_ws notice ignored: blacklist_private ({})", actor)
                 return
-
-        # 2) allowFrom
-        allow_list = [
-            str(x) for x in (getattr(self.config, "allow_from", []) or []) if str(x).strip()
-        ]
-        if allow_list and "*" not in allow_list:
             if chat.chat_type == "group":
-                gid = str(chat.group_id)
-                if not gid or gid not in allow_list:
-                    logger.warning(
-                        "Access denied for group_id {} on channel {}. Add this group_id to allowFrom list.",
-                        gid or "(empty)",
-                        self.name,
-                    )
-                    return
-            else:
-                if str(actor) not in allow_list:
-                    logger.warning(
-                        "Access denied for sender {} on channel {}. Add them to allowFrom list.",
-                        actor,
-                        self.name,
-                    )
-                    return
+                logger.warning(
+                    "Access denied for group_id {} on channel {}. Add this group_id to allowFrom list.",
+                    str(chat.group_id or "").strip() or "(empty)",
+                    self.name,
+                )
+                return
+            logger.warning(
+                "Access denied for sender {} on channel {}. Add them to allowFrom list.",
+                actor,
+                self.name,
+            )
+            return
 
         inbound = InboundMessage(
             channel=self.name,
@@ -3058,58 +3096,34 @@ class NapCatWSChannel(BaseChannel):
         )
 
     def _allow_publish_to_agent(self, msg: NormalizedInbound) -> bool:
-        # allowFrom 语义（NapCatWS 扩展）：
-        #
-        # 需求：允许“用户白名单”和“群白名单”两种写法，同时“黑名单优先级最高”。
-        # 例如：用户A在 allowFrom 中，但用户A在黑名单群里发言 —— 预期仍然不能触发。
-        #
-        # 说明：BaseChannel 只按 sender_id 做 allowlist 判断；而 napcat_ws 的 allowFrom 既可能填 user_id，
-        # 也可能填 group_id（允许白名单群里任何人触发）。因此这里在调用 super()._handle_message() 前先拦一次。
+        gate = PublishGateInput(
+            chat_type=msg.chat.chat_type,
+            actor_id=str(msg.sender_id),
+            group_id=str(msg.chat.group_id),
+        )
+        allowed, reason = _check_publish_gate(gate, config=self.config, channel_name=self.name)
+        if allowed:
+            return True
 
-        # 1) 黑名单优先（防御性：即使上游 trigger 决策已做过黑名单判断，这里仍再次确保）
+        if reason == "blacklist_group":
+            logger.debug("napcat_ws message ignored: blacklist_group ({})", msg.chat.group_id)
+            return False
+        if reason == "blacklist_private":
+            logger.debug("napcat_ws message ignored: blacklist_private ({})", msg.sender_id)
+            return False
         if msg.chat.chat_type == "group":
-            gid = str(msg.chat.group_id)
-            blk_groups = set(
-                str(x) for x in (getattr(self.config, "blacklist_group_ids", []) or [])
+            logger.warning(
+                "Access denied for group_id {} on channel {}. Add this group_id to allowFrom list.",
+                str(msg.chat.group_id or "").strip() or "(empty)",
+                self.name,
             )
-            if gid and gid in blk_groups:
-                logger.debug("napcat_ws message ignored: blacklist_group ({})", gid)
-                return False
-        else:
-            blk_priv = set(
-                str(x) for x in (getattr(self.config, "blacklist_private_ids", []) or [])
-            )
-            # 私聊场景：屏蔽 user_id（即 sender_id）
-            if str(msg.sender_id) in blk_priv:
-                logger.debug("napcat_ws message ignored: blacklist_private ({})", msg.sender_id)
-                return False
-
-        # 2) allowFrom 白名单：支持 user_id 或 group_id。
-        #    约定：allowFrom 为空 → 不限制；包含 "*" → 全允许。
-        #    不做 fallback：群聊只用 group_id，私聊只用 sender_id。
-        allow_list = [
-            str(x) for x in (getattr(self.config, "allow_from", []) or []) if str(x).strip()
-        ]
-        if allow_list and "*" not in allow_list:
-            if msg.chat.chat_type == "group":
-                gid = str(msg.chat.group_id)
-                if not gid or gid not in allow_list:
-                    logger.warning(
-                        "Access denied for group_id {} on channel {}. Add this group_id to allowFrom list.",
-                        gid or "(empty)",
-                        self.name,
-                    )
-                    return False
-            else:
-                if str(msg.sender_id) not in allow_list:
-                    logger.warning(
-                        "Access denied for sender {} on channel {}. Add them to allowFrom list.",
-                        msg.sender_id,
-                        self.name,
-                    )
-                    return False
-
-        return True
+            return False
+        logger.warning(
+            "Access denied for sender {} on channel {}. Add them to allowFrom list.",
+            msg.sender_id,
+            self.name,
+        )
+        return False
 
     async def _handle_message(self, payload: dict[str, Any]) -> None:
         msg = normalize_inbound(
