@@ -237,8 +237,6 @@ TRUNCATION_TAG = "<TRUNCATED>"  # 固定截断标签：在 Prompt/Context 层前
 NO_REPLY_TAG = "<NO_REPLY>"  # 模型返回该标签表示不回复（channel 层应直接跳过发送）
 NO_FOLLOWUP_TAG = "<NO_FOLLOWUP>"  # 模型返回该标签表示不进行后续多次回复
 
-CONTEXT_BEGIN_TAG = "<NAPCAT_WS_CONTEXT>"  # 兼容保留：外围标签名不变，内部格式改为 CQCTX/3 / CQDM/1
-CONTEXT_END_TAG = "</NAPCAT_WS_CONTEXT>"  # 兼容保留：外围标签名不变，内部格式改为 CQCTX/3 / CQDM/1
 
 
 @dataclass(slots=True)
