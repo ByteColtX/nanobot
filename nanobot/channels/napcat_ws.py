@@ -442,6 +442,13 @@ class ExpandedReply:
     m: str = ""
     forward: Optional[ExpandedForward] = None
 
+    # 原始消息体（尽量保留 message segments，便于下载引用消息里的图片）
+    message: Any = None
+    raw_message: Any = None
+
+    # 结构化媒体元信息（由 parser 提取，便于在 message 为 string 时也能下载图片）
+    media_meta: list[dict[str, Any]] = field(default_factory=list)
+
 
 @dataclass(slots=True)
 class ContextMessageLine:
@@ -457,10 +464,9 @@ class ContextMessageLine:
       - f：当本消息是 forward 时，附带已展开的转发节点列表（节点只保留 {"u","m"}）
       - r：当本消息包含 reply 时，附带被引用的原消息（方案 A：{"u","m"}）
 
-    例子：
-      {"u":"原","q":"424155717","id":"208...","m":"..."}
-      {"u":"原","q":"424155717","id":"208...","m":"...","f":[{"u":"张三","m":"好吃"}]}
-      {"u":"原","q":"424155717","id":"208...","m":"[CQ:reply,id=...]123","r":{"u":"张三","m":"原消息"}}
+    额外字段：
+      - media_paths：该条消息可用的本地图片文件路径列表（用于让大模型看见“历史图片”）。
+        注意：该字段不写入 <NAPCAT_WS_CONTEXT> 文本，只用于在本轮请求中合并到 InboundMessage.media。
 
     注意：这里只定义数据结构；序列化/截断规则后续实现。
     """
@@ -473,6 +479,9 @@ class ContextMessageLine:
     # expansions (optional)
     f: Optional[list[dict[str, str]]] = None
     r: Optional[dict[str, str]] = None
+
+    # local image paths (optional)
+    media_paths: list[str] = field(default_factory=list)
 
 
 # =========================================
@@ -904,12 +913,24 @@ class NapCatMessageDetailFetcherV2:
         parsed = self._parser.parse(payload=payload_like, self_id="")
         m = parsed.cq_text or str(data.get("raw_message") or "").strip()
 
+        # 额外：保留引用消息的原始 segments + 结构化 media_meta（便于下载引用消息图片）
+        media_meta = list(getattr(parsed, "media_meta", None) or [])
+
         # 如果引用原消息里包含 forward，可提前展开引用 forward（后续可复用 forward_cache）
         fw: Optional[ExpandedForward] = None
         if parsed.forward_id:
             fw = await self.expand_forward(forward_id=parsed.forward_id, chat=chat)
 
-        return ExpandedReply(id=mid, u=u, q=uid, m=m, forward=fw)
+        return ExpandedReply(
+            id=mid,
+            u=u,
+            q=uid,
+            m=m,
+            forward=fw,
+            message=data.get("message"),
+            raw_message=data.get("raw_message"),
+            media_meta=media_meta,
+        )
 
     async def expand_forward(self, *, forward_id: str, chat: ChatRef) -> ExpandedForward:
         fid = str(forward_id or "").strip()
@@ -995,6 +1016,8 @@ class NapCatContextBuilderV2Impl:
                 obj["r"] = m.r
             if m.f is not None:
                 obj["f"] = m.f
+            # 注意：m.media_paths 不写入上下文文本（避免 token 爆炸 + 泄露本机路径），
+            # 它只用于本轮 InboundMessage.media 合并。
             lines.append(_json_dumps_compact(obj))
 
         lines.append(CONTEXT_END_TAG)
@@ -2622,6 +2645,12 @@ class NapCatWSChannel(BaseChannel):
         # V2: 始终缓存一条 JSON line（用于构建 <NAPCAT_WS_CONTEXT>）
         try:
             v2_line = await self._v2_build_line(msg)
+            # 关键修复：把“这条消息可见的图片”也存进 v2_line（但不写入上下文文本）。
+            # 这样后续触发时可以把历史图片合并进 InboundMessage.media。
+            try:
+                v2_line.media_paths = list(msg.media_paths or [])
+            except Exception:
+                pass
             self._store.append_message(session_key, v2_line)
         except Exception as exc:
             logger.debug("napcat_ws v2 build line failed: {}", exc)
@@ -2705,6 +2734,36 @@ class NapCatWSChannel(BaseChannel):
             bot_name=bot_name,
         )
 
+        # 关键修复：历史/引用/合并转发图片的可见性。
+        # - 当前消息图片：msg.media_paths
+        # - 引用消息图片：msg.reply.media_paths
+        # - 历史窗口图片：来自 store 里 ContextMessageLine.media_paths（不写入上下文文本，仅用于本轮 media 合并）
+        merged_media: list[str] = []
+        try:
+            for p in (msg.media_paths or []):
+                if isinstance(p, str) and p and p not in merged_media:
+                    merged_media.append(p)
+        except Exception:
+            pass
+
+        try:
+            if msg.reply is not None:
+                for p in (msg.reply.media_paths or []):
+                    if isinstance(p, str) and p and p not in merged_media:
+                        merged_media.append(p)
+        except Exception:
+            pass
+
+        try:
+            hist_limit = int(getattr(self.config, "context_max_messages", 20) or 20)
+            hist = self._store.recent_messages(session_key, hist_limit)
+            for line in hist:
+                for p in (getattr(line, "media_paths", None) or []):
+                    if isinstance(p, str) and p and p not in merged_media:
+                        merged_media.append(p)
+        except Exception:
+            pass
+
         # 交给 agent（MessageBus）生成回复；NapCat 的 send() 会把 OutboundMessage 发回平台
         # 注意：群聊白名单是 group_id 级别的，BaseChannel 的 sender_id allowlist 无法表达。
         # 因此这里不再调用 super()._handle_message()，而是直接 publish inbound。
@@ -2714,8 +2773,7 @@ class NapCatWSChannel(BaseChannel):
             chat_id=str(msg.chat.chat_id),
             content=content,
             # 这里必须传“本地文件路径列表”，ContextBuilder 才会读文件并转成 data:image/...;base64 给大模型。
-            # msg.media 是解析出的远端 URL（通常 https://...），Path(url) 不是本地文件，会导致图片被忽略。
-            media=msg.media_paths or [],
+            media=merged_media,
             metadata={
                 "chat_type": msg.chat.chat_type,
                 "user_id": msg.chat.user_id,
@@ -2754,9 +2812,48 @@ class NapCatWSChannel(BaseChannel):
         msg.reply.sender_name = str(exp.u or exp.q or "unknown")
         msg.reply.text = str(exp.m or "")
         msg.reply.media = []
-        msg.reply.media_paths = []
+
+        # 关键修复：引用消息里的图片也要下载到本地并传给大模型。
+        # 不做 fallback：优先用 exp.message（segments），如果 message 不是数组，则用 media_meta 构造最小 segments 下载。
+        try:
+            paths: list[str] = []
+            if isinstance(getattr(exp, "message", None), list):
+                paths = await self._download_images_from_message(getattr(exp, "message"))
+            else:
+                meta = list(getattr(exp, "media_meta", None) or [])
+                fake_message: list[dict[str, Any]] = []
+                for m in meta:
+                    if not isinstance(m, dict):
+                        continue
+                    if str(m.get("type") or "") != "image":
+                        continue
+                    url = str(m.get("url") or "").strip()
+                    name = str(m.get("file") or m.get("safe_name") or "").strip()
+                    if not url or not name:
+                        continue
+                    fake_message.append({"type": "image", "data": {"url": url, "file": name}})
+                if fake_message:
+                    paths = await self._download_images_from_message(fake_message)
+            msg.reply.media_paths = paths
+        except Exception:
+            msg.reply.media_paths = []
+
         msg.reply.forward_items = list(getattr(getattr(exp, "forward", None), "items", None) or [])
         msg.reply.forward_id = str(getattr(exp, "id", "") or rid)
+
+        # 如果引用消息本身是合并转发：也把转发里的图片下载并挂到 reply.media_paths
+        if msg.reply.forward_id:
+            try:
+                fitems = await self._fetch_forward_items(msg.reply.forward_id, msg.chat)
+                msg.reply.forward_items = fitems or msg.reply.forward_items
+                for it in msg.reply.forward_items or []:
+                    if not isinstance(it, dict):
+                        continue
+                    for p in (it.get("media_paths") or []):
+                        if isinstance(p, str) and p and p not in msg.reply.media_paths:
+                            msg.reply.media_paths.append(p)
+            except Exception:
+                pass
 
     async def _fetch_forward_items(self, forward_id: str, chat: ChatRef) -> list[dict[str, Any]]:
         fid = str(forward_id or "").strip()
