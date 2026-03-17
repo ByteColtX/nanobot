@@ -2457,13 +2457,11 @@ class NapCatWSChannel(BaseChannel):
             gid = msg.metadata.get("group_id") or msg.chat_id
             uid = msg.metadata.get("user_id") or msg.chat_id
             target = gid if chat_type == "group" else uid
-            snippet = (content[:200] + "...") if len(content) > 200 else content
             logger.warning(
-                "napcat_ws outbound: invalid cq (allow anyway): {} chat_type={} target={} snippet={}",
+                "napcat_ws outbound invalid_cq allow_anyway detail={} chat_type={} target={}",
                 detail,
                 chat_type,
                 target,
-                snippet,
             )
         else:
             content = validation.normalized_text
@@ -2564,7 +2562,7 @@ class NapCatWSChannel(BaseChannel):
             return
 
         if post_type != "message":
-            self._log_ignored(payload)
+            self._log_ignored_event(payload)
             return
 
         try:
@@ -2624,14 +2622,14 @@ class NapCatWSChannel(BaseChannel):
         )
         if not decision.should_reply:
             if decision.reason != "unsupported_notice":
-                logger.debug("napcat_ws notice ignored: {}", decision.reason)
+                self._log_notice_decision(decision)
             else:
-                self._log_ignored(payload)
+                self._log_ignored_event(payload)
             return
 
         actor = str(payload.get("sender_id") or payload.get("user_id") or "").strip()
         if not actor:
-            logger.debug("napcat_ws notice ignored: missing_actor")
+            logger.debug("napcat_ws notice ignored reason=missing_actor")
             return
 
         sender_name = self._extract_notice_actor_name(payload, fallback=actor)
@@ -2655,9 +2653,8 @@ class NapCatWSChannel(BaseChannel):
             last_ts = float(self._poke_last_ts_by_chat.get(cooldown_key) or 0.0)
             if last_ts and (now_ts - last_ts) < float(cooldown_s):
                 logger.debug(
-                    "napcat_ws poke cooldown: key={} delta={:.1f}s < {}s",
+                    "napcat_ws poke cooldown key={} remaining_lt={}s",
                     cooldown_key,
-                    now_ts - last_ts,
                     cooldown_s,
                 )
                 return
@@ -2688,13 +2685,7 @@ class NapCatWSChannel(BaseChannel):
             ),
         )
 
-        logger.debug(
-            "napcat_ws notice trigger: trigger={} actor={} group_id={} session_key={}",
-            decision.trigger,
-            actor,
-            group_id,
-            session_key,
-        )
+        self._log_notice_decision(decision)
 
         # 需要回复：构建 <NAPCAT_WS_CONTEXT> 并交给 agent
         bot_name = ""
@@ -3016,7 +3007,7 @@ class NapCatWSChannel(BaseChannel):
             message_parser=self._message_parser,
         )
         if msg is None:
-            self._log_ignored(payload)
+            self._log_ignored_event(payload)
             return
 
         await self._enrich_message(msg)
@@ -3044,13 +3035,7 @@ class NapCatWSChannel(BaseChannel):
                 pass
 
         self._log_inbound(msg)
-        logger.debug(
-            "napcat_ws trigger decision: should_reply={} reason={} trigger={} probability={}",
-            decision.should_reply,
-            decision.reason,
-            decision.trigger,
-            decision.probability_used,
-        )
+        self._log_message_decision(decision)
 
         if not decision.should_reply:
             return
@@ -3439,8 +3424,7 @@ class NapCatWSChannel(BaseChannel):
         forward_items = len(msg.forward_items or [])
 
         logger.debug(
-            "napcat_ws inbound: chat_type={} chat_id={} sender={}({}) text={!r} "
-            "media={} at_self={} reply_id={} forward_id={} forward_items={}",
+            "napcat_ws inbound chat_type={} chat_id={} sender={}({}) text={!r} media={} at_self={} reply_id={} forward_id={} forward_items={}",
             msg.chat.chat_type,
             msg.chat.chat_id,
             msg.sender_name,
@@ -3453,89 +3437,36 @@ class NapCatWSChannel(BaseChannel):
             forward_items,
         )
 
-    def _log_trigger_decision(self, session_key: str, msg: NormalizedInbound) -> None:
-        try:
-            decision = decide_message_trigger(
-                msg,
-                config=self.config,
-                store=self._store,
-                session_key=session_key,
-                self_id=str(self._self_id or ""),
-            )
-        except Exception as exc:
-            logger.debug("napcat_ws decide_message_trigger failed: {}", exc)
-            return
-
+    def _log_message_decision(self, decision: TriggerDecision) -> None:
         logger.debug(
-            "napcat_ws trigger decision: should_reply={} reason={} trigger={} probability={}",
+            "napcat_ws message decision should_reply={} reason={} trigger={} probability={}",
             decision.should_reply,
             decision.reason,
             decision.trigger,
             decision.probability_used,
         )
 
-    def _log_ignored(self, payload: dict[str, Any]) -> None:
-        post_type = payload.get("post_type")
-        if post_type is None:
-            return
-
-        notice_type = payload.get("notice_type")
-        sub_type = payload.get("sub_type") or payload.get("notify_type")
-
-        compact = self._compact_payload_for_log(payload)
+    def _log_notice_decision(self, decision: TriggerDecision) -> None:
         logger.debug(
-            "NapCat WS ignored event: post_type={} notice_type={} sub_type={} payload={}",
-            post_type,
-            notice_type,
-            sub_type,
-            compact,
+            "napcat_ws notice decision should_reply={} reason={} trigger={} probability={}",
+            decision.should_reply,
+            decision.reason,
+            decision.trigger,
+            decision.probability_used,
         )
 
-    def _compact_payload_for_log(self, payload: dict[str, Any]) -> str:
-        """将未知事件 payload 压缩成可读、可控长度的字符串。
+    def _log_ignored_event(self, payload: dict[str, Any]) -> None:
+        post_type = str(payload.get("post_type") or "")
+        if not post_type:
+            return
 
-        目标：看见关键字段和值，但不刷屏。
-        """
-
-        def trunc_str(value: Any, *, limit: int = 16) -> Any:
-            if not isinstance(value, str):
-                return value
-            s = value.replace("\n", " ").replace("\r", " ").strip()
-            if len(s) <= limit:
-                return s
-            return s[:limit] + TRUNCATION_TAG
-
-        def compact(value: Any) -> Any:
-            if isinstance(value, dict):
-                return {str(k): compact(v) for k, v in list(value.items())[:40]}
-            if isinstance(value, list):
-                head = [compact(v) for v in value[:10]]
-                if len(value) > 10:
-                    head.append({"...": f"+{len(value) - 10} more"})
-                return head
-            if isinstance(value, str):
-                return trunc_str(value)
-            return value
-
-        filtered: dict[str, Any] = dict(payload)
-
-        # 裁剪常见大字段
-        if "raw_message" in filtered:
-            filtered["raw_message"] = trunc_str(filtered.get("raw_message"), limit=48)
-        if "message" in filtered:
-            filtered["message"] = compact(filtered.get("message"))
-
-        data = compact(filtered)
-        try:
-            out = json.dumps(data, ensure_ascii=False, sort_keys=True)
-        except Exception:
-            out = str(data)
-
-        # 最终截断，保证一行能看完
-        max_len = 220
-        if len(out) > max_len:
-            out = out[:max_len] + TRUNCATION_TAG
-        return out
+        logger.debug(
+            "napcat_ws ignored post_type={} notice_type={} sub_type={} message_type={}",
+            post_type,
+            payload.get("notice_type") or "",
+            payload.get("sub_type") or payload.get("notify_type") or "",
+            payload.get("message_type") or "",
+        )
 
 
 # 向后兼容导出（如果旧代码用 from ... import NapCatWSChannel）
