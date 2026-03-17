@@ -955,7 +955,15 @@ class NapCatMessageDetailFetcherV2:
             if isinstance(node, str):
                 payload_like = {"message": node, "raw_message": node, "message_format": "string"}
                 parsed = self._parser.parse(payload=payload_like, self_id="")
-                m = parsed.cq_text or str(node)
+                m_raw = parsed.cq_text or str(node)
+                m = m_raw
+                if getattr(self._transport, "config", None) is not None:
+                    try:
+                        limit = int(getattr(self._transport.config, "user_text_truncate_chars", 0) or 0)
+                    except Exception:
+                        limit = 0
+                    if limit > 0 and len(m) > limit:
+                        m = m[:limit] + TRUNCATION_TAG
                 items.append({"u": "unknown", "m": m})
                 # 尝试从 CQ 字符串解析图片（https url）
                 if parsed.media_meta:
@@ -977,7 +985,14 @@ class NapCatMessageDetailFetcherV2:
                 "message_format": "array" if isinstance(node.get("message"), list) else "string",
             }
             parsed = self._parser.parse(payload=payload_like, self_id="")
-            m = parsed.cq_text or str(node.get("raw_message") or "").strip()
+            m_raw = parsed.cq_text or str(node.get("raw_message") or "").strip()
+            m = m_raw
+            try:
+                limit = int(getattr(self._transport.config, "user_text_truncate_chars", 0) or 0)
+            except Exception:
+                limit = 0
+            if limit > 0 and len(m) > limit:
+                m = m[:limit] + TRUNCATION_TAG
             items.append({"u": u, "m": m})
             if parsed.media_meta:
                 media_meta.extend(list(parsed.media_meta))
@@ -1891,6 +1906,24 @@ class NapCatWSChannel(BaseChannel):
     def _now_ts(self) -> float:
         return datetime.now().timestamp()
 
+    def _truncate_user_text(self, s: str) -> str:
+        """Truncate a single user message to keep context readable.
+
+        Rule (per config.user_text_truncate_chars):
+        - limit <= 0: no truncation
+        - len(text) > limit: text[:limit] + TRUNCATION_TAG
+
+        NOTE: This is for context/input shaping only (not for outbound bot replies).
+        """
+
+        limit = int(getattr(self.config, "user_text_truncate_chars", 0) or 0)
+        text = str(s or "")
+        if limit <= 0:
+            return text
+        if len(text) <= limit:
+            return text
+        return text[:limit] + TRUNCATION_TAG
+
     async def _ensure_login_info(self) -> None:
         """按需拉取登录信息，填充 self_id 与账号昵称。"""
 
@@ -2500,7 +2533,8 @@ class NapCatWSChannel(BaseChannel):
             "message_format": message_format,
         }
         parsed = self._parser_v2.parse(payload=payload_like, self_id=str(self._self_id or ""))
-        m = parsed.cq_text or str(msg.raw_event.get("raw_message") or msg.rendered_text or msg.text or "").strip()
+        m_raw = parsed.cq_text or str(msg.raw_event.get("raw_message") or msg.rendered_text or msg.text or "").strip()
+        m = self._truncate_user_text(m_raw)
 
         line = ContextMessageLine(
             u=str(msg.sender_name or msg.sender_id or "unknown"),
@@ -2523,7 +2557,8 @@ class NapCatWSChannel(BaseChannel):
                     "message_format": "array" if isinstance(msg.reply.message, list) else "string",
                 }
                 pq = self._parser_v2.parse(payload=payload_like_quote, self_id=str(self._self_id or ""))
-                qm = str(pq.cq_text or "").strip() or str(msg.reply.text or "").strip()
+                qm_raw = str(pq.cq_text or "").strip() or str(msg.reply.text or "").strip()
+                qm = self._truncate_user_text(qm_raw)
                 qu = str(msg.reply.sender_name or msg.reply.sender_id or "unknown")
                 if qu and qm:
                     line.r = {"u": qu, "m": qm}
@@ -2537,7 +2572,7 @@ class NapCatWSChannel(BaseChannel):
                     exp = None
 
                 if exp is not None and str(exp.u or "").strip() and str(exp.m or "").strip():
-                    line.r = {"u": str(exp.u), "m": str(exp.m)}
+                    line.r = {"u": str(exp.u), "m": self._truncate_user_text(str(exp.m))}
 
         # forward 展开：优先复用现有 msg.forward_items（已 expand_forward），否则走 cache+fetcher
         fid = str(parsed.forward_id or "").strip()
@@ -2563,6 +2598,8 @@ class NapCatWSChannel(BaseChannel):
                     if not t2:
                         # 兜底：退回旧 pipeline 的 rendered_text（仍可能包含占位符）
                         t2 = str(it.get("text") or "").strip()
+
+                    t2 = self._truncate_user_text(t2)
 
                     if t2:
                         items_v2.append({"u": u2, "m": t2})
