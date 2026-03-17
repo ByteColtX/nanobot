@@ -251,6 +251,55 @@ class CQCtxReverseMap:
     forward_node_replies: dict[str, str] = field(default_factory=dict)
 
 
+class InMemoryMessageCache:
+    """进程内存消息详情缓存（reply / forward）。"""
+
+    def __init__(self, *, ttl_seconds: int, reply_maxsize: int, forward_maxsize: int) -> None:
+        self._ttl = max(0, int(ttl_seconds or 0))
+        self._reply_maxsize = max(1, int(reply_maxsize or 1))
+        self._forward_maxsize = max(1, int(forward_maxsize or 1))
+        self._reply: OrderedDict[str, tuple[float, Any]] = OrderedDict()
+        self._forward: OrderedDict[str, tuple[float, Any]] = OrderedDict()
+
+    def _now(self) -> float:
+        return time.time()
+
+    def _get(self, store: OrderedDict[str, tuple[float, Any]], key: str) -> Any | None:
+        k = str(key or "").strip()
+        if not k:
+            return None
+        item = store.get(k)
+        if item is None:
+            return None
+        ts, value = item
+        if self._ttl > 0 and (self._now() - ts) > self._ttl:
+            store.pop(k, None)
+            return None
+        store.move_to_end(k)
+        return value
+
+    def _set(self, store: OrderedDict[str, tuple[float, Any]], key: str, value: Any, maxsize: int) -> None:
+        k = str(key or "").strip()
+        if not k:
+            return
+        store[k] = (self._now(), value)
+        store.move_to_end(k)
+        while len(store) > maxsize:
+            store.popitem(last=False)
+
+    def get_reply(self, message_id: str) -> Any | None:
+        return self._get(self._reply, message_id)
+
+    def set_reply(self, message_id: str, value: Any) -> None:
+        self._set(self._reply, message_id, value, self._reply_maxsize)
+
+    def get_forward(self, forward_id: str) -> Any | None:
+        return self._get(self._forward, forward_id)
+
+    def set_forward(self, forward_id: str, value: Any) -> None:
+        self._set(self._forward, forward_id, value, self._forward_maxsize)
+
+
 @dataclass(slots=True)
 class ChatRef:
     """归一化后的聊天定位信息。
@@ -1290,44 +1339,6 @@ class NapCatMessageDetailFetcherV2:
             summary = ""
         return ExpandedForward(id=fid, items=items, media_meta=media_meta, summary=summary)
 
-
-
-class NapCatContextBuilderV2Impl:
-    """V2 上下文构建器：输出 JSON lines，不包含 group_name。"""
-
-    def build(
-        self,
-        *,
-        chat: ChatRef,
-        bot_name: str,
-        bot_id: str,
-        time_window_label: str,
-        prompts: list[str],
-        messages: list[ContextMessageLine],
-    ) -> str:
-        lines: list[str] = []
-        lines.append(CONTEXT_BEGIN_TAG)
-        lines.append(f"chat_type={chat.chat_type} chat_id={chat.chat_id}")
-        lines.append(f"bot={bot_name}(self_id={bot_id})")
-        lines.append(f"time_window={time_window_label}")
-
-        if prompts:
-            lines.append("\n# Some prompts")
-            lines.extend(prompts)
-
-        lines.append("\n# Messages (oldest -> newest)")
-        for m in messages:
-            obj: dict[str, Any] = {"u": m.u, "q": m.q, "id": m.id, "m": m.m}
-            if m.r is not None:
-                obj["r"] = m.r
-            if m.f is not None:
-                obj["f"] = m.f
-            # 注意：m.media_paths 不写入上下文文本（避免 token 爆炸 + 泄露本机路径），
-            # 它只用于本轮 InboundMessage.media 合并。
-            lines.append(_json_dumps_compact(obj))
-
-        lines.append(CONTEXT_END_TAG)
-        return "\n".join(lines)
 
 @dataclass(slots=True)
 class V2SessionState:
