@@ -348,15 +348,6 @@ class NormalizedInbound:
 
 
 @dataclass(slots=True)
-class PublishGateInput:
-    """Channel publish gate 输入。用于二次 publish 门禁，不参与 trigger 语义。"""
-
-    chat_type: ChatType
-    actor_id: str
-    group_id: str = ""
-
-
-@dataclass(slots=True)
 class TriggerDecision:
     """Policy 层的触发决策结果。"""
 
@@ -1984,50 +1975,34 @@ def decide_notice_trigger(
     if actor == str(self_id or ""):
         return TriggerDecision(False, "poke_self")
 
-    return TriggerDecision(True, "poke", "poke")
+    group_id = str(payload.get("group_id") or "").strip()
+    raw_info = payload.get("raw_info")
+    if not group_id and isinstance(raw_info, dict):
+        for key in ("group_id", "groupId", "peer_uin", "peerUin", "peer_uid", "peerUid"):
+            value = raw_info.get(key)
+            if value:
+                group_id = str(value).strip()
+                if group_id:
+                    break
 
-
-def _check_publish_gate(
-    gate: PublishGateInput,
-    *,
-    config: NapCatWSConfig,
-    channel_name: str,
-) -> tuple[bool, str | None]:
-    """检查 publish 前的二次门禁。
-
-    返回：
-    - (True, None): 允许继续 publish
-    - (False, reason): 拒绝 publish，reason 仅用于日志/调试
-
-    说明：
-    - 这不是 trigger policy；只是 channel 在真正 publish 给 agent 前的防御性 gate。
-    - allow_from 仅支持三种语义：`*`、群号、QQ号。
-    - 当前保留与既有行为一致的 allowFrom / blacklist 语义。
-    """
-
-    if gate.chat_type == "group":
-        gid = str(gate.group_id or "").strip()
-        blk_groups = set(str(x) for x in (getattr(config, "blacklist_group_ids", []) or []))
-        if gid and gid in blk_groups:
-            return False, "blacklist_group"
+    if group_id:
+        blk = set(str(x) for x in (getattr(config, "blacklist_group_ids", []) or []))
+        if group_id in blk:
+            return TriggerDecision(False, "blacklist_group")
     else:
-        actor = str(gate.actor_id or "").strip()
-        blk_priv = set(str(x) for x in (getattr(config, "blacklist_private_ids", []) or []))
-        if actor in blk_priv:
-            return False, "blacklist_private"
+        blk = set(str(x) for x in (getattr(config, "blacklist_private_ids", []) or []))
+        if actor in blk:
+            return TriggerDecision(False, "blacklist_private")
 
     allow_list = [str(x) for x in (getattr(config, "allow_from", []) or []) if str(x).strip()]
     if allow_list and "*" not in allow_list:
-        if gate.chat_type == "group":
-            gid = str(gate.group_id or "").strip()
-            if not gid or gid not in allow_list:
-                return False, f"allow_group_denied:{gid or '(empty)'}@{channel_name}"
-        else:
-            actor = str(gate.actor_id or "").strip()
-            if actor not in allow_list:
-                return False, f"allow_private_denied:{actor}@{channel_name}"
+        if group_id:
+            if group_id not in allow_list:
+                return TriggerDecision(False, "not_allowed")
+        elif actor not in allow_list:
+            return TriggerDecision(False, "not_allowed")
 
-    return True, None
+    return TriggerDecision(True, "poke", "poke")
 
 
 # =========================================
@@ -2638,18 +2613,6 @@ class NapCatWSChannel(BaseChannel):
                 return
             self._poke_last_ts_by_chat[cooldown_key] = now_ts
 
-        # 黑名单：与 message 保持一致（notice 不走概率/昵称/@/reply 触发，但仍应尊重黑名单）
-        if group_id:
-            blk = set(str(x) for x in (getattr(self.config, "blacklist_group_ids", []) or []))
-            if str(group_id) in blk:
-                logger.debug("napcat_ws notice ignored: blacklist_group")
-                return
-        else:
-            blk = set(str(x) for x in (getattr(self.config, "blacklist_private_ids", []) or []))
-            if str(actor) in blk:
-                logger.debug("napcat_ws notice ignored: blacklist_private")
-                return
-
         # 生成“事件 id”：notice 没有 message_id，避免使用空字符串造成上下文难以定位
         notice_type = str(payload.get("notice_type") or "notice").strip() or "notice"
         sub_type = str(payload.get("sub_type") or payload.get("notify_type") or "").strip() or ""
@@ -2706,15 +2669,6 @@ class NapCatWSChannel(BaseChannel):
             session_key=session_key,
             bot_name=bot_name,
         )
-
-        # allowFrom 语义（NapCatWS 扩展）：支持 user_id 或 group_id（群聊只用 group_id，不做 fallback）
-        gate = PublishGateInput(
-            chat_type=chat.chat_type,
-            actor_id=str(actor),
-            group_id=str(chat.group_id),
-        )
-        if not self._allow_publish_to_agent(gate, kind="notice"):
-            return
 
         inbound = InboundMessage(
             channel=self.name,
@@ -3064,32 +3018,6 @@ class NapCatWSChannel(BaseChannel):
             },
             session_key_override=session_key,
         )
-
-    def _allow_publish_to_agent(self, gate: PublishGateInput, *, kind: str) -> bool:
-        """防御性 publish gate。当前主要保留给 notice 链路使用。"""
-        allowed, reason = _check_publish_gate(gate, config=self.config, channel_name=self.name)
-        if allowed:
-            return True
-
-        if reason == "blacklist_group":
-            logger.debug("napcat_ws {} ignored: blacklist_group ({})", kind, gate.group_id)
-            return False
-        if reason == "blacklist_private":
-            logger.debug("napcat_ws {} ignored: blacklist_private ({})", kind, gate.actor_id)
-            return False
-        if gate.chat_type == "group":
-            logger.warning(
-                "Access denied for group_id {} on channel {}. Add this group_id to allowFrom list.",
-                str(gate.group_id or "").strip() or "(empty)",
-                self.name,
-            )
-            return False
-        logger.warning(
-            "Access denied for sender {} on channel {}. Add them to allowFrom list.",
-            gate.actor_id,
-            self.name,
-        )
-        return False
 
     async def _handle_message(self, payload: dict[str, Any]) -> None:
         msg = normalize_inbound(
