@@ -1314,7 +1314,555 @@ class SessionBufferStore:
 
 
 # ==============================
-# 2) Transport
+# 2) Inbound normalize
+# ==============================
+
+
+def make_session_key(chat: ChatRef) -> str:
+    """根据 chat 生成稳定的 session key。"""
+
+    return f"napcat:{chat.chat_type}:{chat.chat_id}"
+
+
+def normalize_inbound(
+    payload: dict[str, Any],
+    *,
+    self_id: str,
+    config: NapCatWSConfig,
+    message_parser: NapCatMessageParser | None = None,
+) -> NormalizedInbound | None:
+    """将 OneBot payload 归一化为内部消息结构。
+
+    Inbound 主链路只依赖消息解析器：
+        - 仅处理 post_type == "message"
+        - 统一在 normalize 阶段完成 plain/rendered/reply/forward/@/media 抽取
+        - 不再混用 legacy message parser
+
+    说明：
+        - reply/forward 的“展开拉取”（get_msg / get_forward_msg）放在 channel 回调里做
+        - system prompt 不在这里注入；这里只产出聊天消息语义
+    """
+
+    if not isinstance(payload, dict):
+        return None
+
+    # 兼容你贴的 debug 日志格式：{"stringMsg":{...},"arrayMsg":{...}}
+    if "post_type" not in payload:
+        wrapped = None
+        if isinstance(payload.get("arrayMsg"), dict):
+            wrapped = payload.get("arrayMsg")
+        elif isinstance(payload.get("stringMsg"), dict):
+            wrapped = payload.get("stringMsg")
+        if isinstance(wrapped, dict):
+            payload = wrapped
+
+    if payload.get("post_type") != "message":
+        return None
+
+    message_type = payload.get("message_type")
+    chat_type: ChatType = "group" if message_type == "group" else "private"
+
+    user_id = str(payload.get("user_id") or "")
+    group_id = str(payload.get("group_id") or "")
+    chat_id = group_id if chat_type == "group" else user_id
+    if not chat_id:
+        return None
+
+    sender = payload.get("sender") or {}
+    if not isinstance(sender, dict):
+        sender = {}
+
+    sender_name = (
+        str(sender.get("card") or "").strip()
+        or str(sender.get("nickname") or "").strip()
+        or str(sender.get("remark") or "").strip()
+        or user_id
+        or "unknown"
+    )
+
+    message_id = str(payload.get("message_id") or "")
+
+    ts = payload.get("time")
+    try:
+        timestamp = datetime.fromtimestamp(int(ts)) if ts is not None else datetime.now()
+    except Exception:
+        timestamp = datetime.now()
+
+    message_field = payload.get("message")
+    if message_field in (None, ""):
+        message_field = payload.get("raw_message")
+
+    # 构造一个最小 payload 供消息解析器使用：
+    # - message: 取 message/raw_message 的兜底
+    # - raw_message/message_format: 原样透传
+    payload_like = {
+        "message": message_field,
+        "raw_message": payload.get("raw_message"),
+        "message_format": payload.get("message_format"),
+    }
+    parsed_message = (
+        message_parser.parse(payload=payload_like, self_id=str(self_id or ""))
+        if message_parser
+        else ParsedMessage()
+    )
+
+    text = str(parsed_message.plain_text or "").strip()
+    rendered_text = str(
+        parsed_message.rendered_text or parsed_message.cq_text or text or ""
+    ).strip()
+    rendered_segments = list(parsed_message.rendered_segments or [])
+
+    reply_message_id = str(parsed_message.reply_id or "")
+    reply: QuotedMessage | None = None
+    if reply_message_id:
+        reply = QuotedMessage(message_id=reply_message_id)
+
+    sid = str(self_id or "").strip()
+    at_self = bool(sid and sid in [str(x).strip() for x in parsed_message.at_qq])
+    forward_id = str(parsed_message.forward_id or "")
+
+    return NormalizedInbound(
+        chat=ChatRef(
+            chat_type=chat_type,
+            chat_id=str(chat_id),
+            user_id=user_id,
+            group_id=group_id,
+        ),
+        sender_id=user_id,
+        sender_name=sender_name,
+        message_id=message_id,
+        timestamp=timestamp,
+        text=text,
+        rendered_text=rendered_text,
+        rendered_segments=rendered_segments,
+        media=list(parsed_message.media or []),
+        at_self=at_self,
+        reply=reply,
+        forward_id=forward_id,
+        raw_event=payload,
+    )
+
+
+def _safe_media_filename(name: str) -> str:
+    """把 OneBot/NapCat 的 file/name 变成可展示的安全文件名。"""
+
+    s = str(name or "").strip()
+    if not s:
+        return ""
+
+    # 防止路径穿越：只取 basename，并兼容 "\\" 分隔符
+    s = s.replace("\\", "/")
+    s = s.split("/")[-1].strip()
+
+    if not s or s in {".", ".."}:
+        return ""
+
+    cleaned: list[str] = []
+    for ch in s:
+        if ch.isalnum() or ch in {".", "_", "-"}:
+            cleaned.append(ch)
+        else:
+            cleaned.append("_")
+
+    safe = "".join(cleaned).strip("._")
+    if not safe:
+        return ""
+
+    if len(safe) > 180:
+        safe = safe[:180]
+
+    return safe
+
+
+# ==============================
+# 3) Policy
+# ==============================
+
+
+def _normalize_text_for_match(text: str) -> str:
+    """用于触发词匹配的标准化：小写 + 压缩空白。"""
+
+    s = (text or "").strip().lower()
+    # 不做复杂分词，保持“包含即触发”的直觉规则
+    return " ".join(s.split())
+
+
+def _contains_any(text: str, keywords: list[str]) -> bool:
+    """规则：消息任意位置包含即触发（大小写不敏感）。"""
+
+    hay = _normalize_text_for_match(text)
+    if not hay:
+        return False
+    for kw in keywords or []:
+        k = _normalize_text_for_match(str(kw))
+        if k and k in hay:
+            return True
+    return False
+
+
+def _stable_random_0_1(seed: str) -> float:
+    """稳定伪随机数（0~1）。
+
+    用途：概率触发不依赖全局 random 状态，便于测试/复现。
+    """
+
+    import hashlib
+
+    h = hashlib.sha256(seed.encode("utf-8", "ignore")).digest()
+    # 取前 8 字节作为无符号整数
+    n = int.from_bytes(h[:8], "big", signed=False)
+    return (n % 1_000_000) / 1_000_000.0
+
+
+def _is_allowed_source(msg: NormalizedInbound, config: NapCatWSConfig) -> bool:
+    """allow_from 白名单判断。
+
+    仅支持三种语义：
+      - "*"：全部允许
+      - "<群号>"：允许对应群聊
+      - "<QQ号>"：允许对应私聊 / 对应发送者
+    """
+
+    allow = list(getattr(config, "allow_from", []) or [])
+    if not allow:
+        # schema 默认是 ["*"]，这里保持“空=不额外限制”的宽松策略
+        return True
+
+    allow = [str(x).strip() for x in allow if str(x).strip()]
+    if "*" in allow:
+        return True
+
+    sender_id = str(msg.sender_id or "").strip()
+    if msg.chat.chat_type == "group":
+        gid = str(msg.chat.group_id or msg.chat.chat_id or "").strip()
+        return bool(gid and gid in allow)
+
+    uid = str(msg.chat.user_id or msg.chat.chat_id or sender_id or "").strip()
+    return bool((uid and uid in allow) or (sender_id and sender_id in allow))
+
+
+def _is_reply_to_bot(
+    msg: NormalizedInbound, *, store: SessionBufferStore, session_key: str, self_id: str
+) -> bool:
+    """判断 msg.reply 是否是在回复 bot。"""
+
+    if not msg.reply or not msg.reply.message_id:
+        return False
+
+    # 1) 优先使用 quote expand 得到的 sender_id
+    if str(msg.reply.sender_id or "").strip() and str(msg.reply.sender_id).strip() == str(self_id):
+        return True
+
+    # 2) 兜底：检查 reply 的 message_id 是否是 bot 近期发出的 message_id
+    return store.is_bot_message_id(session_key, msg.reply.message_id)
+
+
+def _message_has_content(msg: NormalizedInbound) -> bool:
+    """判断消息是否包含可响应内容。"""
+
+    return (
+        bool(str(msg.text or "").strip())
+        or bool(msg.media)
+        or bool(msg.forward_items)
+        or bool(str(msg.forward_summary or "").strip())
+        or bool(str(msg.forward_id or "").strip())
+    )
+
+
+def _probability_for_message(
+    msg: NormalizedInbound, config: NapCatWSConfig
+) -> tuple[float, TriggerType]:
+    """返回当前消息适用的概率及触发类型。"""
+
+    if msg.chat.chat_type == "private":
+        return float(
+            getattr(config, "private_trigger_probability", 0.0) or 0.0
+        ), "private_probability"
+    return float(getattr(config, "group_trigger_probability", 0.0) or 0.0), "group_probability"
+
+
+def _message_probability_seed(msg: NormalizedInbound, *, session_key: str) -> str:
+    """构造 message 概率触发使用的稳定 seed。"""
+
+    return f"{session_key}|{msg.message_id}|{msg.sender_id}|{msg.timestamp.timestamp()}"
+
+
+def _check_message_source_gate(
+    msg: NormalizedInbound, *, config: NapCatWSConfig, self_id: str
+) -> TriggerDecision | None:
+    """执行 message 来源侧门禁；放行时返回 None。"""
+
+    if not _is_allowed_source(msg, config):
+        return TriggerDecision(False, "not_allowed")
+
+    if getattr(config, "ignore_self_messages", True) and str(msg.sender_id) == str(self_id):
+        return TriggerDecision(False, "ignore_self")
+
+    if msg.chat.chat_type == "private":
+        blk = set(str(x) for x in (getattr(config, "blacklist_private_ids", []) or []))
+        if str(msg.chat.chat_id) in blk or str(msg.sender_id) in blk:
+            return TriggerDecision(False, "blacklist_private")
+        return None
+
+    blk = set(str(x) for x in (getattr(config, "blacklist_group_ids", []) or []))
+    gid = str(msg.chat.group_id or msg.chat.chat_id)
+    if gid in blk:
+        return TriggerDecision(False, "blacklist_group")
+    return None
+
+
+def _check_message_direct_trigger(
+    msg: NormalizedInbound,
+    *,
+    config: NapCatWSConfig,
+    store: SessionBufferStore,
+    session_key: str,
+    self_id: str,
+) -> TriggerDecision | None:
+    """执行 message 直接触发检查；未命中时返回 None。"""
+
+    if (
+        msg.chat.chat_type == "group"
+        and getattr(config, "trigger_on_at", True)
+        and bool(msg.at_self)
+    ):
+        return TriggerDecision(True, "at_bot", "at_bot")
+
+    if getattr(config, "trigger_on_reply_to_bot", True) and _is_reply_to_bot(
+        msg, store=store, session_key=session_key, self_id=self_id
+    ):
+        return TriggerDecision(True, "reply_to_bot", "reply_to_bot")
+
+    nicknames = list(getattr(config, "nickname_triggers", []) or [])
+    if nicknames and _contains_any(msg.text, nicknames):
+        return TriggerDecision(True, "nickname", "nickname")
+
+    return None
+
+
+def _decide_message_probability_trigger(
+    msg: NormalizedInbound, *, config: NapCatWSConfig, session_key: str
+) -> TriggerDecision:
+    """执行 message 概率触发决策。"""
+
+    if not _message_has_content(msg):
+        return TriggerDecision(False, "no_content")
+
+    probability, trigger = _probability_for_message(msg, config)
+    if probability <= 0.0:
+        return TriggerDecision(False, "probability=0", trigger, probability)
+    if probability >= 1.0:
+        return TriggerDecision(True, "probability=1", trigger, probability)
+
+    sample = _stable_random_0_1(_message_probability_seed(msg, session_key=session_key))
+    if sample < probability:
+        return TriggerDecision(
+            True, f"probability({sample:.3f}<{probability:.3f})", trigger, probability
+        )
+    return TriggerDecision(
+        False, f"probability({sample:.3f}>={probability:.3f})", trigger, probability
+    )
+
+
+def decide_message_trigger(
+    msg: NormalizedInbound,
+    *,
+    config: NapCatWSConfig,
+    store: SessionBufferStore,
+    session_key: str,
+    self_id: str,
+) -> TriggerDecision:
+    """决定 message 事件是否触发回复。"""
+
+    gate = _check_message_source_gate(msg, config=config, self_id=self_id)
+    if gate is not None:
+        return gate
+
+    direct = _check_message_direct_trigger(
+        msg,
+        config=config,
+        store=store,
+        session_key=session_key,
+        self_id=self_id,
+    )
+    if direct is not None:
+        return direct
+
+    return _decide_message_probability_trigger(msg, config=config, session_key=session_key)
+
+
+def decide_notice_trigger(
+    payload: dict[str, Any],
+    *,
+    config: NapCatWSConfig,
+    self_id: str,
+) -> TriggerDecision:
+    """决定 notice 事件是否触发回复。当前仅支持 poke。"""
+
+    notice_type = payload.get("notice_type")
+    sub_type = payload.get("sub_type") or payload.get("notify_type")
+    if not (notice_type == "notify" and sub_type == "poke"):
+        return TriggerDecision(False, "unsupported_notice")
+
+    if not getattr(config, "trigger_on_poke", False):
+        return TriggerDecision(False, "poke_disabled")
+
+    actor = str(payload.get("sender_id") or payload.get("user_id") or "").strip()
+    if not actor:
+        return TriggerDecision(False, "poke_missing_actor")
+    if actor == str(self_id or ""):
+        return TriggerDecision(False, "poke_self")
+
+    group_id = str(payload.get("group_id") or "").strip()
+    raw_info = payload.get("raw_info")
+    if not group_id and isinstance(raw_info, dict):
+        for key in ("group_id", "groupId", "peer_uin", "peerUin", "peer_uid", "peerUid"):
+            value = raw_info.get(key)
+            if value:
+                group_id = str(value).strip()
+                if group_id:
+                    break
+
+    if group_id:
+        blk = set(str(x) for x in (getattr(config, "blacklist_group_ids", []) or []))
+        if group_id in blk:
+            return TriggerDecision(False, "blacklist_group")
+    else:
+        blk = set(str(x) for x in (getattr(config, "blacklist_private_ids", []) or []))
+        if actor in blk:
+            return TriggerDecision(False, "blacklist_private")
+
+    allow_list = [str(x) for x in (getattr(config, "allow_from", []) or []) if str(x).strip()]
+    if allow_list and "*" not in allow_list:
+        if group_id:
+            if group_id not in allow_list:
+                return TriggerDecision(False, "not_allowed")
+        elif actor not in allow_list:
+            return TriggerDecision(False, "not_allowed")
+
+    return TriggerDecision(True, "poke", "poke")
+
+
+# =========================================
+# 4) Outbound helpers
+# =========================================
+
+_CQ_OUTBOUND_RE = re.compile(r"\[CQ:([^,\]]+)(?:,([^\]]+))?\]")
+
+
+def _parse_cq_params(params_raw: str) -> dict[str, str]:
+    params: dict[str, str] = {}
+    if not params_raw:
+        return params
+    for chunk in params_raw.split(","):
+        part = str(chunk or "").strip()
+        if not part:
+            continue
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = str(key).strip()
+        value = str(value).strip()
+        if key:
+            params[key] = value
+    return params
+
+
+def _file_uri_to_local_path(file_uri: str) -> str | None:
+    raw = str(file_uri or "").strip()
+    if not raw:
+        return None
+    if not raw.startswith("file://"):
+        return None
+    parsed = urlparse(raw)
+    if parsed.scheme != "file":
+        return None
+    path = os.path.abspath(os.path.expanduser(parsed.path or ""))
+    return path or None
+
+
+def validate_outbound_cq_text(content: str) -> CQValidationResult:
+    """轻校验模型生成的 CQ 出站文本。
+
+    当前仅正式支持：
+      - [CQ:at,qq=...]
+      - [CQ:reply,id=...]
+      - [CQ:image,file=file:///...]
+
+    其它 CQ 先视为未支持，要求模型重写。
+    """
+
+    text = str(content or "")
+    issues: list[CQValidationIssue] = []
+
+    for match in _CQ_OUTBOUND_RE.finditer(text):
+        cq_text = match.group(0)
+        cq_type = str(match.group(1) or "").strip().lower()
+        params = _parse_cq_params(match.group(2) or "")
+
+        if cq_type == "at":
+            qq = str(params.get("qq") or "").strip()
+            if not qq:
+                issues.append(
+                    CQValidationIssue("missing_required_param", "at 缺少 qq 参数", cq_text)
+                )
+                continue
+            if qq != "all" and not qq.isdigit():
+                issues.append(
+                    CQValidationIssue("invalid_param_value", f"at.qq 非法: {qq}", cq_text)
+                )
+                continue
+            continue
+
+        if cq_type == "reply":
+            reply_id = str(params.get("id") or "").strip()
+            if not reply_id:
+                issues.append(
+                    CQValidationIssue("missing_required_param", "reply 缺少 id 参数", cq_text)
+                )
+                continue
+            continue
+
+        if cq_type == "image":
+            file_uri = str(params.get("file") or "").strip()
+            if not file_uri:
+                issues.append(
+                    CQValidationIssue("missing_required_param", "image 缺少 file 参数", cq_text)
+                )
+                continue
+            local_path = _file_uri_to_local_path(file_uri)
+            if not local_path:
+                issues.append(
+                    CQValidationIssue(
+                        "invalid_param_value", f"image.file 必须是 file:// URI: {file_uri}", cq_text
+                    )
+                )
+                continue
+            if not os.path.exists(local_path):
+                issues.append(
+                    CQValidationIssue(
+                        "image_file_not_found", f"image.file 不存在: {local_path}", cq_text
+                    )
+                )
+                continue
+            if not os.path.isfile(local_path):
+                issues.append(
+                    CQValidationIssue(
+                        "invalid_param_value", f"image.file 不是普通文件: {local_path}", cq_text
+                    )
+                )
+                continue
+            continue
+
+        issues.append(
+            CQValidationIssue("unsupported_cq_type", f"暂不支持的 CQ 类型: {cq_type}", cq_text)
+        )
+
+    return CQValidationResult(valid=not issues, normalized_text=text, issues=issues)
+
+
+# ==============================
+# 5) Transport
 # ==============================
 
 
@@ -1621,560 +2169,7 @@ class NapCatTransport:
 
 
 # ==============================
-# 3) Normalize 层（OneBot payload -> 内部结构）
-# ==============================
-
-
-def make_session_key(chat: ChatRef) -> str:
-    """根据 chat 生成稳定的 session key。"""
-
-    return f"napcat:{chat.chat_type}:{chat.chat_id}"
-
-
-def normalize_inbound(
-    payload: dict[str, Any],
-    *,
-    self_id: str,
-    config: NapCatWSConfig,
-    message_parser: NapCatMessageParser | None = None,
-) -> NormalizedInbound | None:
-    """将 OneBot payload 归一化为内部消息结构。
-
-    Inbound 主链路只依赖消息解析器：
-        - 仅处理 post_type == "message"
-        - 统一在 normalize 阶段完成 plain/rendered/reply/forward/@/media 抽取
-        - 不再混用 legacy message parser
-
-    说明：
-        - reply/forward 的“展开拉取”（get_msg / get_forward_msg）放在 channel 回调里做
-        - system prompt 不在这里注入；这里只产出聊天消息语义
-    """
-
-    if not isinstance(payload, dict):
-        return None
-
-    # 兼容你贴的 debug 日志格式：{"stringMsg":{...},"arrayMsg":{...}}
-    if "post_type" not in payload:
-        wrapped = None
-        if isinstance(payload.get("arrayMsg"), dict):
-            wrapped = payload.get("arrayMsg")
-        elif isinstance(payload.get("stringMsg"), dict):
-            wrapped = payload.get("stringMsg")
-        if isinstance(wrapped, dict):
-            payload = wrapped
-
-    if payload.get("post_type") != "message":
-        return None
-
-    message_type = payload.get("message_type")
-    chat_type: ChatType = "group" if message_type == "group" else "private"
-
-    user_id = str(payload.get("user_id") or "")
-    group_id = str(payload.get("group_id") or "")
-    chat_id = group_id if chat_type == "group" else user_id
-    if not chat_id:
-        return None
-
-    sender = payload.get("sender") or {}
-    if not isinstance(sender, dict):
-        sender = {}
-
-    sender_name = (
-        str(sender.get("card") or "").strip()
-        or str(sender.get("nickname") or "").strip()
-        or str(sender.get("remark") or "").strip()
-        or user_id
-        or "unknown"
-    )
-
-    message_id = str(payload.get("message_id") or "")
-
-    ts = payload.get("time")
-    try:
-        timestamp = datetime.fromtimestamp(int(ts)) if ts is not None else datetime.now()
-    except Exception:
-        timestamp = datetime.now()
-
-    message_field = payload.get("message")
-    if message_field in (None, ""):
-        message_field = payload.get("raw_message")
-
-    # 构造一个最小 payload 供消息解析器使用：
-    # - message: 取 message/raw_message 的兜底
-    # - raw_message/message_format: 原样透传
-    payload_like = {
-        "message": message_field,
-        "raw_message": payload.get("raw_message"),
-        "message_format": payload.get("message_format"),
-    }
-    parsed_message = (
-        message_parser.parse(payload=payload_like, self_id=str(self_id or ""))
-        if message_parser
-        else ParsedMessage()
-    )
-
-    text = str(parsed_message.plain_text or "").strip()
-    rendered_text = str(
-        parsed_message.rendered_text or parsed_message.cq_text or text or ""
-    ).strip()
-    rendered_segments = list(parsed_message.rendered_segments or [])
-
-    reply_message_id = str(parsed_message.reply_id or "")
-    reply: QuotedMessage | None = None
-    if reply_message_id:
-        reply = QuotedMessage(message_id=reply_message_id)
-
-    sid = str(self_id or "").strip()
-    at_self = bool(sid and sid in [str(x).strip() for x in parsed_message.at_qq])
-    forward_id = str(parsed_message.forward_id or "")
-
-    return NormalizedInbound(
-        chat=ChatRef(
-            chat_type=chat_type,
-            chat_id=str(chat_id),
-            user_id=user_id,
-            group_id=group_id,
-        ),
-        sender_id=user_id,
-        sender_name=sender_name,
-        message_id=message_id,
-        timestamp=timestamp,
-        text=text,
-        rendered_text=rendered_text,
-        rendered_segments=rendered_segments,
-        media=list(parsed_message.media or []),
-        at_self=at_self,
-        reply=reply,
-        forward_id=forward_id,
-        raw_event=payload,
-    )
-
-
-def _safe_media_filename(name: str) -> str:
-    """把 OneBot/NapCat 的 file/name 变成可展示的安全文件名。"""
-
-    s = str(name or "").strip()
-    if not s:
-        return ""
-
-    # 防止路径穿越：只取 basename，并兼容 "\\" 分隔符
-    s = s.replace("\\", "/")
-    s = s.split("/")[-1].strip()
-
-    if not s or s in {".", ".."}:
-        return ""
-
-    cleaned: list[str] = []
-    for ch in s:
-        if ch.isalnum() or ch in {".", "_", "-"}:
-            cleaned.append(ch)
-        else:
-            cleaned.append("_")
-
-    safe = "".join(cleaned).strip("._")
-    if not safe:
-        return ""
-
-    if len(safe) > 180:
-        safe = safe[:180]
-
-    return safe
-
-
-# ==============================
-# 4) Policy 层（触发决策）
-# ==============================
-
-
-def _normalize_text_for_match(text: str) -> str:
-    """用于触发词匹配的标准化：小写 + 压缩空白。"""
-
-    s = (text or "").strip().lower()
-    # 不做复杂分词，保持“包含即触发”的直觉规则
-    return " ".join(s.split())
-
-
-def _contains_any(text: str, keywords: list[str]) -> bool:
-    """规则：消息任意位置包含即触发（大小写不敏感）。"""
-
-    hay = _normalize_text_for_match(text)
-    if not hay:
-        return False
-    for kw in keywords or []:
-        k = _normalize_text_for_match(str(kw))
-        if k and k in hay:
-            return True
-    return False
-
-
-# =========================================
-# 3) Policy
-# =========================================
-
-
-def _stable_random_0_1(seed: str) -> float:
-    """稳定伪随机数（0~1）。
-
-    用途：概率触发不依赖全局 random 状态，便于测试/复现。
-    """
-
-    import hashlib
-
-    h = hashlib.sha256(seed.encode("utf-8", "ignore")).digest()
-    # 取前 8 字节作为无符号整数
-    n = int.from_bytes(h[:8], "big", signed=False)
-    return (n % 1_000_000) / 1_000_000.0
-
-
-def _is_allowed_source(msg: NormalizedInbound, config: NapCatWSConfig) -> bool:
-    """allow_from 白名单判断。
-
-    仅支持三种语义：
-      - "*"：全部允许
-      - "<群号>"：允许对应群聊
-      - "<QQ号>"：允许对应私聊 / 对应发送者
-    """
-
-    allow = list(getattr(config, "allow_from", []) or [])
-    if not allow:
-        # schema 默认是 ["*"]，这里保持“空=不额外限制”的宽松策略
-        return True
-
-    allow = [str(x).strip() for x in allow if str(x).strip()]
-    if "*" in allow:
-        return True
-
-    sender_id = str(msg.sender_id or "").strip()
-    if msg.chat.chat_type == "group":
-        gid = str(msg.chat.group_id or msg.chat.chat_id or "").strip()
-        return bool(gid and gid in allow)
-
-    uid = str(msg.chat.user_id or msg.chat.chat_id or sender_id or "").strip()
-    return bool((uid and uid in allow) or (sender_id and sender_id in allow))
-
-
-def _is_reply_to_bot(
-    msg: NormalizedInbound, *, store: SessionBufferStore, session_key: str, self_id: str
-) -> bool:
-    """判断 msg.reply 是否是在回复 bot。"""
-
-    if not msg.reply or not msg.reply.message_id:
-        return False
-
-    # 1) 优先使用 quote expand 得到的 sender_id
-    if str(msg.reply.sender_id or "").strip() and str(msg.reply.sender_id).strip() == str(self_id):
-        return True
-
-    # 2) 兜底：检查 reply 的 message_id 是否是 bot 近期发出的 message_id
-    return store.is_bot_message_id(session_key, msg.reply.message_id)
-
-
-def _message_has_content(msg: NormalizedInbound) -> bool:
-    """判断消息是否包含可响应内容。"""
-
-    return (
-        bool(str(msg.text or "").strip())
-        or bool(msg.media)
-        or bool(msg.forward_items)
-        or bool(str(msg.forward_summary or "").strip())
-        or bool(str(msg.forward_id or "").strip())
-    )
-
-
-def _probability_for_message(
-    msg: NormalizedInbound, config: NapCatWSConfig
-) -> tuple[float, TriggerType]:
-    """返回当前消息适用的概率及触发类型。"""
-
-    if msg.chat.chat_type == "private":
-        return float(
-            getattr(config, "private_trigger_probability", 0.0) or 0.0
-        ), "private_probability"
-    return float(getattr(config, "group_trigger_probability", 0.0) or 0.0), "group_probability"
-
-
-def _message_probability_seed(msg: NormalizedInbound, *, session_key: str) -> str:
-    """构造 message 概率触发使用的稳定 seed。"""
-
-    return f"{session_key}|{msg.message_id}|{msg.sender_id}|{msg.timestamp.timestamp()}"
-
-
-def _check_message_source_gate(
-    msg: NormalizedInbound, *, config: NapCatWSConfig, self_id: str
-) -> TriggerDecision | None:
-    """执行 message 来源侧门禁；放行时返回 None。"""
-
-    if not _is_allowed_source(msg, config):
-        return TriggerDecision(False, "not_allowed")
-
-    if getattr(config, "ignore_self_messages", True) and str(msg.sender_id) == str(self_id):
-        return TriggerDecision(False, "ignore_self")
-
-    if msg.chat.chat_type == "private":
-        blk = set(str(x) for x in (getattr(config, "blacklist_private_ids", []) or []))
-        if str(msg.chat.chat_id) in blk or str(msg.sender_id) in blk:
-            return TriggerDecision(False, "blacklist_private")
-        return None
-
-    blk = set(str(x) for x in (getattr(config, "blacklist_group_ids", []) or []))
-    gid = str(msg.chat.group_id or msg.chat.chat_id)
-    if gid in blk:
-        return TriggerDecision(False, "blacklist_group")
-    return None
-
-
-def _check_message_direct_trigger(
-    msg: NormalizedInbound,
-    *,
-    config: NapCatWSConfig,
-    store: SessionBufferStore,
-    session_key: str,
-    self_id: str,
-) -> TriggerDecision | None:
-    """执行 message 直接触发检查；未命中时返回 None。"""
-
-    if (
-        msg.chat.chat_type == "group"
-        and getattr(config, "trigger_on_at", True)
-        and bool(msg.at_self)
-    ):
-        return TriggerDecision(True, "at_bot", "at_bot")
-
-    if getattr(config, "trigger_on_reply_to_bot", True) and _is_reply_to_bot(
-        msg, store=store, session_key=session_key, self_id=self_id
-    ):
-        return TriggerDecision(True, "reply_to_bot", "reply_to_bot")
-
-    nicknames = list(getattr(config, "nickname_triggers", []) or [])
-    if nicknames and _contains_any(msg.text, nicknames):
-        return TriggerDecision(True, "nickname", "nickname")
-
-    return None
-
-
-def _decide_message_probability_trigger(
-    msg: NormalizedInbound, *, config: NapCatWSConfig, session_key: str
-) -> TriggerDecision:
-    """执行 message 概率触发决策。"""
-
-    if not _message_has_content(msg):
-        return TriggerDecision(False, "no_content")
-
-    probability, trigger = _probability_for_message(msg, config)
-    if probability <= 0.0:
-        return TriggerDecision(False, "probability=0", trigger, probability)
-    if probability >= 1.0:
-        return TriggerDecision(True, "probability=1", trigger, probability)
-
-    sample = _stable_random_0_1(_message_probability_seed(msg, session_key=session_key))
-    if sample < probability:
-        return TriggerDecision(
-            True, f"probability({sample:.3f}<{probability:.3f})", trigger, probability
-        )
-    return TriggerDecision(
-        False, f"probability({sample:.3f}>={probability:.3f})", trigger, probability
-    )
-
-
-def decide_message_trigger(
-    msg: NormalizedInbound,
-    *,
-    config: NapCatWSConfig,
-    store: SessionBufferStore,
-    session_key: str,
-    self_id: str,
-) -> TriggerDecision:
-    """决定 message 事件是否触发回复。"""
-
-    gate = _check_message_source_gate(msg, config=config, self_id=self_id)
-    if gate is not None:
-        return gate
-
-    direct = _check_message_direct_trigger(
-        msg,
-        config=config,
-        store=store,
-        session_key=session_key,
-        self_id=self_id,
-    )
-    if direct is not None:
-        return direct
-
-    return _decide_message_probability_trigger(msg, config=config, session_key=session_key)
-
-
-def decide_notice_trigger(
-    payload: dict[str, Any],
-    *,
-    config: NapCatWSConfig,
-    self_id: str,
-) -> TriggerDecision:
-    """决定 notice 事件是否触发回复。当前仅支持 poke。"""
-
-    notice_type = payload.get("notice_type")
-    sub_type = payload.get("sub_type") or payload.get("notify_type")
-    if not (notice_type == "notify" and sub_type == "poke"):
-        return TriggerDecision(False, "unsupported_notice")
-
-    if not getattr(config, "trigger_on_poke", False):
-        return TriggerDecision(False, "poke_disabled")
-
-    actor = str(payload.get("sender_id") or payload.get("user_id") or "").strip()
-    if not actor:
-        return TriggerDecision(False, "poke_missing_actor")
-    if actor == str(self_id or ""):
-        return TriggerDecision(False, "poke_self")
-
-    group_id = str(payload.get("group_id") or "").strip()
-    raw_info = payload.get("raw_info")
-    if not group_id and isinstance(raw_info, dict):
-        for key in ("group_id", "groupId", "peer_uin", "peerUin", "peer_uid", "peerUid"):
-            value = raw_info.get(key)
-            if value:
-                group_id = str(value).strip()
-                if group_id:
-                    break
-
-    if group_id:
-        blk = set(str(x) for x in (getattr(config, "blacklist_group_ids", []) or []))
-        if group_id in blk:
-            return TriggerDecision(False, "blacklist_group")
-    else:
-        blk = set(str(x) for x in (getattr(config, "blacklist_private_ids", []) or []))
-        if actor in blk:
-            return TriggerDecision(False, "blacklist_private")
-
-    allow_list = [str(x) for x in (getattr(config, "allow_from", []) or []) if str(x).strip()]
-    if allow_list and "*" not in allow_list:
-        if group_id:
-            if group_id not in allow_list:
-                return TriggerDecision(False, "not_allowed")
-        elif actor not in allow_list:
-            return TriggerDecision(False, "not_allowed")
-
-    return TriggerDecision(True, "poke", "poke")
-
-
-# =========================================
-# 4) Outbound validation helpers
-# =========================================
-
-_CQ_OUTBOUND_RE = re.compile(r"\[CQ:([^,\]]+)(?:,([^\]]+))?\]")
-
-
-def _parse_cq_params(params_raw: str) -> dict[str, str]:
-    params: dict[str, str] = {}
-    if not params_raw:
-        return params
-    for chunk in params_raw.split(","):
-        part = str(chunk or "").strip()
-        if not part:
-            continue
-        if "=" not in part:
-            continue
-        key, value = part.split("=", 1)
-        key = str(key).strip()
-        value = str(value).strip()
-        if key:
-            params[key] = value
-    return params
-
-
-def _file_uri_to_local_path(file_uri: str) -> str | None:
-    raw = str(file_uri or "").strip()
-    if not raw:
-        return None
-    if not raw.startswith("file://"):
-        return None
-    parsed = urlparse(raw)
-    if parsed.scheme != "file":
-        return None
-    path = os.path.abspath(os.path.expanduser(parsed.path or ""))
-    return path or None
-
-
-def validate_outbound_cq_text(content: str) -> CQValidationResult:
-    """轻校验模型生成的 CQ 出站文本。
-
-    当前仅正式支持：
-      - [CQ:at,qq=...]
-      - [CQ:reply,id=...]
-      - [CQ:image,file=file:///...]
-
-    其它 CQ 先视为未支持，要求模型重写。
-    """
-
-    text = str(content or "")
-    issues: list[CQValidationIssue] = []
-
-    for match in _CQ_OUTBOUND_RE.finditer(text):
-        cq_text = match.group(0)
-        cq_type = str(match.group(1) or "").strip().lower()
-        params = _parse_cq_params(match.group(2) or "")
-
-        if cq_type == "at":
-            qq = str(params.get("qq") or "").strip()
-            if not qq:
-                issues.append(
-                    CQValidationIssue("missing_required_param", "at 缺少 qq 参数", cq_text)
-                )
-                continue
-            if qq != "all" and not qq.isdigit():
-                issues.append(
-                    CQValidationIssue("invalid_param_value", f"at.qq 非法: {qq}", cq_text)
-                )
-                continue
-            continue
-
-        if cq_type == "reply":
-            reply_id = str(params.get("id") or "").strip()
-            if not reply_id:
-                issues.append(
-                    CQValidationIssue("missing_required_param", "reply 缺少 id 参数", cq_text)
-                )
-                continue
-            continue
-
-        if cq_type == "image":
-            file_uri = str(params.get("file") or "").strip()
-            if not file_uri:
-                issues.append(
-                    CQValidationIssue("missing_required_param", "image 缺少 file 参数", cq_text)
-                )
-                continue
-            local_path = _file_uri_to_local_path(file_uri)
-            if not local_path:
-                issues.append(
-                    CQValidationIssue(
-                        "invalid_param_value", f"image.file 必须是 file:// URI: {file_uri}", cq_text
-                    )
-                )
-                continue
-            if not os.path.exists(local_path):
-                issues.append(
-                    CQValidationIssue(
-                        "image_file_not_found", f"image.file 不存在: {local_path}", cq_text
-                    )
-                )
-                continue
-            if not os.path.isfile(local_path):
-                issues.append(
-                    CQValidationIssue(
-                        "invalid_param_value", f"image.file 不是普通文件: {local_path}", cq_text
-                    )
-                )
-                continue
-            continue
-
-        issues.append(
-            CQValidationIssue("unsupported_cq_type", f"暂不支持的 CQ 类型: {cq_type}", cq_text)
-        )
-
-    return CQValidationResult(valid=not issues, normalized_text=text, issues=issues)
-
-
-# ==============================
-# 5) Channel
+# 6) Channel
 # ==============================
 
 
