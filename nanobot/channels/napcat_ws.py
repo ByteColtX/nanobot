@@ -2618,7 +2618,9 @@ class NapCatWSChannel(BaseChannel):
             sender_id=str(msg.sender_id),
             chat_id=str(msg.chat.chat_id),
             content=content,
-            media=msg.media or [],
+            # 这里必须传“本地文件路径列表”，ContextBuilder 才会读文件并转成 data:image/...;base64 给大模型。
+            # msg.media 是解析出的远端 URL（通常 https://...），Path(url) 不是本地文件，会导致图片被忽略。
+            media=msg.media_paths or [],
             metadata={
                 "chat_type": msg.chat.chat_type,
                 "user_id": msg.chat.user_id,
@@ -2761,7 +2763,7 @@ class NapCatWSChannel(BaseChannel):
                 continue
 
             part = dest.with_name(dest.name + ".part")
-            ok = await asyncio.to_thread(self._download_one_https_file, url, part, dest)
+            ok = await asyncio.to_thread(self._download_one_http_file, url, part, dest)
             if ok:
                 paths.append(str(dest))
 
@@ -2833,8 +2835,8 @@ class NapCatWSChannel(BaseChannel):
 
         return safe
 
-    def _download_one_https_file(self, url: str, part: Path, dest: Path) -> bool:
-        """下载单个 https 文件。
+    def _download_one_http_file(self, url: str, part: Path, dest: Path) -> bool:
+        """下载单个 http/https 文件。
 
         说明：
         - 该函数会在 asyncio.to_thread 中执行（阻塞 IO）。
