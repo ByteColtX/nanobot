@@ -2963,17 +2963,7 @@ class NapCatWSChannel(BaseChannel):
             messages=hist,
         )
 
-    async def _handle_message(self, payload: dict[str, Any]) -> None:
-        msg = normalize_inbound(
-            payload,
-            self_id=str(self._self_id or ""),
-            config=self.config,
-            parser_v2=self._parser_v2,
-        )
-        if msg is None:
-            self._log_ignored(payload)
-            return
-
+    async def _enrich_message(self, msg: NormalizedInbound) -> None:
         msg.media_paths = await self._download_images_from_message(msg.raw_event.get("message"))
 
         await self._expand_quote(msg)
@@ -2992,17 +2982,7 @@ class NapCatWSChannel(BaseChannel):
         except Exception:
             pass
 
-        session_key = make_session_key(msg.chat)
-
-        # 先决策（避免把当前 msg 写入 store 后又被 history 重复读到）
-        decision = decide_message_trigger(
-            msg,
-            config=self.config,
-            store=self._store,
-            session_key=session_key,
-            self_id=str(self._self_id or ""),
-        )
-
+    async def _cache_message_line(self, *, msg: NormalizedInbound, session_key: str) -> None:
         # V2: 始终缓存一条 JSON line（用于构建 <NAPCAT_WS_CONTEXT>）
         try:
             v2_line = await self._v2_build_line(msg)
@@ -3016,91 +2996,7 @@ class NapCatWSChannel(BaseChannel):
         except Exception as exc:
             logger.debug("napcat_ws v2 build line failed: {}", exc)
 
-        # 缓存 bot 自己的昵称（用于把 @self 渲染成 @昵称；不影响其它逻辑）
-        if msg.at_self and msg.chat.chat_type == "group":
-            try:
-                # 如果当前消息里出现了 @self，而 config 里没填 self_nickname，就用群里看到的 sender_name 兜底不了
-                # 这里不做自动学习，避免误学；仅在聊天上下文 render 时使用 config.self_nickname。
-                pass
-            except Exception:
-                pass
-
-        self._log_inbound(msg)
-        logger.debug(
-            "napcat_ws trigger decision: should_reply={} reason={} trigger={} probability={}",
-            decision.should_reply,
-            decision.reason,
-            decision.trigger,
-            decision.probability_used,
-        )
-
-        if not decision.should_reply:
-            return
-
-        # allowFrom 语义（NapCatWS 扩展）：
-        #
-        # 需求：允许“用户白名单”和“群白名单”两种写法，同时“黑名单优先级最高”。
-        # 例如：用户A在 allowFrom 中，但用户A在黑名单群里发言 —— 预期仍然不能触发。
-        #
-        # 说明：BaseChannel 只按 sender_id 做 allowlist 判断；而 napcat_ws 的 allowFrom 既可能填 user_id，
-        # 也可能填 group_id（允许白名单群里任何人触发）。因此这里在调用 super()._handle_message() 前先拦一次。
-
-        # 1) 黑名单优先（防御性：即使上游 trigger 决策已做过黑名单判断，这里仍再次确保）
-        if msg.chat.chat_type == "group":
-            gid = str(msg.chat.group_id)
-            blk_groups = set(
-                str(x) for x in (getattr(self.config, "blacklist_group_ids", []) or [])
-            )
-            if gid and gid in blk_groups:
-                logger.debug("napcat_ws message ignored: blacklist_group ({})", gid)
-                return
-        else:
-            blk_priv = set(
-                str(x) for x in (getattr(self.config, "blacklist_private_ids", []) or [])
-            )
-            # 私聊场景：屏蔽 user_id（即 sender_id）
-            if str(msg.sender_id) in blk_priv:
-                logger.debug("napcat_ws message ignored: blacklist_private ({})", msg.sender_id)
-                return
-
-        # 2) allowFrom 白名单：支持 user_id 或 group_id。
-        #    约定：allowFrom 为空 → 不限制；包含 "*" → 全允许。
-        #    不做 fallback：群聊只用 group_id，私聊只用 sender_id。
-        allow_list = [
-            str(x) for x in (getattr(self.config, "allow_from", []) or []) if str(x).strip()
-        ]
-        if allow_list and "*" not in allow_list:
-            if msg.chat.chat_type == "group":
-                gid = str(msg.chat.group_id)
-                if not gid or gid not in allow_list:
-                    logger.warning(
-                        "Access denied for group_id {} on channel {}. Add this group_id to allowFrom list.",
-                        gid or "(empty)",
-                        self.name,
-                    )
-                    return
-            else:
-                if str(msg.sender_id) not in allow_list:
-                    logger.warning(
-                        "Access denied for sender {} on channel {}. Add them to allowFrom list.",
-                        msg.sender_id,
-                        self.name,
-                    )
-                    return
-
-        bot_name = ""
-        try:
-            if msg.chat.chat_type == "group" and msg.chat.group_id:
-                bot_name = await self._get_bot_display_name_for_group(msg.chat.group_id)
-        except Exception:
-            bot_name = ""
-
-        content = self._build_chat_context_v2(
-            msg=msg,
-            session_key=session_key,
-            bot_name=bot_name,
-        )
-
+    def _collect_visible_media(self, *, msg: NormalizedInbound, session_key: str) -> list[str]:
         # 关键修复：历史/引用/合并转发图片的可见性。
         # - 当前消息图片：msg.media_paths
         # - 引用消息图片：msg.reply.media_paths
@@ -3131,10 +3027,18 @@ class NapCatWSChannel(BaseChannel):
         except Exception:
             pass
 
-        # 交给 agent（MessageBus）生成回复；NapCat 的 send() 会把 OutboundMessage 发回平台
-        # 注意：群聊白名单是 group_id 级别的，BaseChannel 的 sender_id allowlist 无法表达。
-        # 因此这里不再调用 super()._handle_message()，而是直接 publish inbound。
-        inbound = InboundMessage(
+        return merged_media
+
+    def _build_agent_inbound(
+        self,
+        *,
+        msg: NormalizedInbound,
+        session_key: str,
+        content: str,
+        merged_media: list[str],
+        decision: TriggerDecision,
+    ) -> InboundMessage:
+        return InboundMessage(
             channel=self.name,
             sender_id=str(msg.sender_id),
             chat_id=str(msg.chat.chat_id),
@@ -3151,6 +3055,136 @@ class NapCatWSChannel(BaseChannel):
                 "_napcat_trigger_reason": decision.reason,
             },
             session_key_override=session_key,
+        )
+
+    def _allow_publish_to_agent(self, msg: NormalizedInbound) -> bool:
+        # allowFrom 语义（NapCatWS 扩展）：
+        #
+        # 需求：允许“用户白名单”和“群白名单”两种写法，同时“黑名单优先级最高”。
+        # 例如：用户A在 allowFrom 中，但用户A在黑名单群里发言 —— 预期仍然不能触发。
+        #
+        # 说明：BaseChannel 只按 sender_id 做 allowlist 判断；而 napcat_ws 的 allowFrom 既可能填 user_id，
+        # 也可能填 group_id（允许白名单群里任何人触发）。因此这里在调用 super()._handle_message() 前先拦一次。
+
+        # 1) 黑名单优先（防御性：即使上游 trigger 决策已做过黑名单判断，这里仍再次确保）
+        if msg.chat.chat_type == "group":
+            gid = str(msg.chat.group_id)
+            blk_groups = set(
+                str(x) for x in (getattr(self.config, "blacklist_group_ids", []) or [])
+            )
+            if gid and gid in blk_groups:
+                logger.debug("napcat_ws message ignored: blacklist_group ({})", gid)
+                return False
+        else:
+            blk_priv = set(
+                str(x) for x in (getattr(self.config, "blacklist_private_ids", []) or [])
+            )
+            # 私聊场景：屏蔽 user_id（即 sender_id）
+            if str(msg.sender_id) in blk_priv:
+                logger.debug("napcat_ws message ignored: blacklist_private ({})", msg.sender_id)
+                return False
+
+        # 2) allowFrom 白名单：支持 user_id 或 group_id。
+        #    约定：allowFrom 为空 → 不限制；包含 "*" → 全允许。
+        #    不做 fallback：群聊只用 group_id，私聊只用 sender_id。
+        allow_list = [
+            str(x) for x in (getattr(self.config, "allow_from", []) or []) if str(x).strip()
+        ]
+        if allow_list and "*" not in allow_list:
+            if msg.chat.chat_type == "group":
+                gid = str(msg.chat.group_id)
+                if not gid or gid not in allow_list:
+                    logger.warning(
+                        "Access denied for group_id {} on channel {}. Add this group_id to allowFrom list.",
+                        gid or "(empty)",
+                        self.name,
+                    )
+                    return False
+            else:
+                if str(msg.sender_id) not in allow_list:
+                    logger.warning(
+                        "Access denied for sender {} on channel {}. Add them to allowFrom list.",
+                        msg.sender_id,
+                        self.name,
+                    )
+                    return False
+
+        return True
+
+    async def _handle_message(self, payload: dict[str, Any]) -> None:
+        msg = normalize_inbound(
+            payload,
+            self_id=str(self._self_id or ""),
+            config=self.config,
+            parser_v2=self._parser_v2,
+        )
+        if msg is None:
+            self._log_ignored(payload)
+            return
+
+        await self._enrich_message(msg)
+
+        session_key = make_session_key(msg.chat)
+
+        # 先决策（避免把当前 msg 写入 store 后又被 history 重复读到）
+        decision = decide_message_trigger(
+            msg,
+            config=self.config,
+            store=self._store,
+            session_key=session_key,
+            self_id=str(self._self_id or ""),
+        )
+
+        await self._cache_message_line(msg=msg, session_key=session_key)
+
+        # 缓存 bot 自己的昵称（用于把 @self 渲染成 @昵称；不影响其它逻辑）
+        if msg.at_self and msg.chat.chat_type == "group":
+            try:
+                # 如果当前消息里出现了 @self，而 config 里没填 self_nickname，就用群里看到的 sender_name 兜底不了
+                # 这里不做自动学习，避免误学；仅在聊天上下文 render 时使用 config.self_nickname。
+                pass
+            except Exception:
+                pass
+
+        self._log_inbound(msg)
+        logger.debug(
+            "napcat_ws trigger decision: should_reply={} reason={} trigger={} probability={}",
+            decision.should_reply,
+            decision.reason,
+            decision.trigger,
+            decision.probability_used,
+        )
+
+        if not decision.should_reply:
+            return
+
+        if not self._allow_publish_to_agent(msg):
+            return
+
+        bot_name = ""
+        try:
+            if msg.chat.chat_type == "group" and msg.chat.group_id:
+                bot_name = await self._get_bot_display_name_for_group(msg.chat.group_id)
+        except Exception:
+            bot_name = ""
+
+        content = self._build_chat_context_v2(
+            msg=msg,
+            session_key=session_key,
+            bot_name=bot_name,
+        )
+
+        merged_media = self._collect_visible_media(msg=msg, session_key=session_key)
+
+        # 交给 agent（MessageBus）生成回复；NapCat 的 send() 会把 OutboundMessage 发回平台
+        # 注意：群聊白名单是 group_id 级别的，BaseChannel 的 sender_id allowlist 无法表达。
+        # 因此这里不再调用 super()._handle_message()，而是直接 publish inbound。
+        inbound = self._build_agent_inbound(
+            msg=msg,
+            session_key=session_key,
+            content=content,
+            merged_media=merged_media,
+            decision=decision,
         )
         await self.bus.publish_inbound(inbound)
         return
