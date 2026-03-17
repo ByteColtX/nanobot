@@ -57,6 +57,11 @@ from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
 
 
+# ==============================
+# 0) Pure helpers
+# ==============================
+
+
 def summarize_onebot_event(payload: dict[str, Any]) -> str:
     """Build a compact summary string for logs.
 
@@ -85,13 +90,9 @@ def summarize_onebot_event(payload: dict[str, Any]) -> str:
     return " ".join(parts) if parts else "empty_payload"
 
 
-from nanobot.bus.events import InboundMessage, OutboundMessage
-from nanobot.bus.queue import MessageBus
-from nanobot.channels.base import BaseChannel
-from nanobot.config.paths import get_media_dir
-from nanobot.config.schema import Base
-
-from pydantic import Field
+# ==============================
+# 0.1) Channel config
+# ==============================
 
 
 class NapCatWSConfig(Base):
@@ -159,8 +160,7 @@ class NapCatWSConfig(Base):
     context_message_max_chars: int = Field(
         default=200,
         description=(
-            "单条上下文消息的最大字符数。超过则截断并追加 <TRUNCATED>；"
-            "0 或负数表示不截断。"
+            "单条上下文消息的最大字符数。超过则截断并追加 <TRUNCATED>；0 或负数表示不截断。"
         ),
     )
     ignore_self_messages: bool = Field(
@@ -174,7 +174,12 @@ class NapCatWSConfig(Base):
         description="一次多轮回复最多连续发送的条数",
     )
 
-# NOTE: transport层也会用到 OneBot action 常量（get_login_info）
+
+# NOTE: transport 层也会用到 OneBot action 常量（get_login_info）
+
+# ==============================
+# 0.2) Transport deps
+# ==============================
 
 try:
     import websockets
@@ -192,7 +197,9 @@ except ImportError:  # pragma: no cover
 # ==============================
 
 ChatType = Literal["private", "group"]
-TriggerType = Literal["private_probability", "group_probability", "nickname", "poke", "at_bot", "reply_to_bot"]
+TriggerType = Literal[
+    "private_probability", "group_probability", "nickname", "poke", "at_bot", "reply_to_bot"
+]
 
 NoticeKind = Literal["poke", "other_notice"]
 
@@ -254,7 +261,9 @@ class InMemoryMessageCache:
         store.move_to_end(k)
         return value
 
-    def _set(self, store: OrderedDict[str, tuple[float, Any]], key: str, value: Any, maxsize: int) -> None:
+    def _set(
+        self, store: OrderedDict[str, tuple[float, Any]], key: str, value: Any, maxsize: int
+    ) -> None:
         k = str(key or "").strip()
         if not k:
             return
@@ -530,13 +539,19 @@ class _CQCtxSymbolTable:
         ref = self.user_by_qq.get(qq_s)
         if ref is not None:
             if is_bot:
-                self.reverse.users.setdefault(ref, {}).update({"qq": qq_s, "name": str(name or qq_s), "bot": "1"})
+                self.reverse.users.setdefault(ref, {}).update(
+                    {"qq": qq_s, "name": str(name or qq_s), "bot": "1"}
+                )
             return ref
         ref = f"u{len(self.user_rows)}"
         row = {"ref": ref, "qq": qq_s, "name": str(name or qq_s), "bot": bool(is_bot)}
         self.user_by_qq[qq_s] = ref
         self.user_rows.append(row)
-        self.reverse.users[ref] = {"qq": qq_s, "name": str(name or qq_s), "bot": "1" if is_bot else "0"}
+        self.reverse.users[ref] = {
+            "qq": qq_s,
+            "name": str(name or qq_s),
+            "bot": "1" if is_bot else "0",
+        }
         return ref
 
     def image_ref(self, filename: str) -> str:
@@ -573,7 +588,7 @@ class _CQCtxBodyEncoder:
         pos = 0
         for m in self._token_re.finditer(src):
             if m.start() > pos:
-                out.append(_cqctx_escape(src[pos:m.start()]))
+                out.append(_cqctx_escape(src[pos : m.start()]))
             typ = str(m.group(1) or "").strip().lower()
             params = _parse_cq_params(m.group(2) or "")
             out.append(self._map_token(typ, params, node_ref_map=node_ref_map))
@@ -582,7 +597,9 @@ class _CQCtxBodyEncoder:
             out.append(_cqctx_escape(src[pos:]))
         return "".join(out).strip()
 
-    def _map_token(self, typ: str, params: dict[str, str], *, node_ref_map: Optional[dict[str, str]]) -> str:
+    def _map_token(
+        self, typ: str, params: dict[str, str], *, node_ref_map: Optional[dict[str, str]]
+    ) -> str:
         if typ == "at":
             qq = str(params.get("qq") or "").strip()
             if not qq:
@@ -638,55 +655,110 @@ class NapCatContextBuilderV2Impl:
         bot_id: str,
         messages: list[ContextMessageLine],
     ) -> CQCtxReverseMap:
-        symbols = self._collect_symbols(chat=chat, bot_name=bot_name, bot_id=bot_id, messages=messages)
+        symbols = self._collect_symbols(
+            chat=chat, bot_name=bot_name, bot_id=bot_id, messages=messages
+        )
         return symbols.reverse
 
-    def _build_group(self, *, chat: ChatRef, bot_name: str, bot_id: str, messages: list[ContextMessageLine]) -> str:
-        symbols = self._collect_symbols(chat=chat, bot_name=bot_name, bot_id=bot_id, messages=messages)
-        bot_ref = symbols.user_ref(qq=str(bot_id or "0"), name=str(bot_name or bot_id or "bot"), is_bot=True)
-        rows: list[str] = [f"<CQCTX/3 g:{_cqctx_escape(chat.chat_id)} bot:{bot_ref} n:{len(messages)}>" ]
+    def _build_group(
+        self, *, chat: ChatRef, bot_name: str, bot_id: str, messages: list[ContextMessageLine]
+    ) -> str:
+        symbols = self._collect_symbols(
+            chat=chat, bot_name=bot_name, bot_id=bot_id, messages=messages
+        )
+        bot_ref = symbols.user_ref(
+            qq=str(bot_id or "0"), name=str(bot_name or bot_id or "bot"), is_bot=True
+        )
+        rows: list[str] = [
+            f"<CQCTX/3 g:{_cqctx_escape(chat.chat_id)} bot:{bot_ref} n:{len(messages)}>"
+        ]
         for row in symbols.user_rows:
             suffix = "|bot" if row.get("bot") else ""
-            rows.append(f"U|{row['ref']}|{_cqctx_escape(row['qq'])}|{_cqctx_escape(row['name'])}{suffix}")
+            rows.append(
+                f"U|{row['ref']}|{_cqctx_escape(row['qq'])}|{_cqctx_escape(row['name'])}{suffix}"
+            )
         for row in symbols.image_rows:
             rows.append(f"I|{row['ref']}|{_cqctx_escape(row['filename'])}")
         encoder = _CQCtxBodyEncoder(symbols=symbols, is_group=True)
-        rows.extend(self._serialize_messages(messages=messages, symbols=symbols, encoder=encoder, private_mode=False, bot_id=str(bot_id or ""), bot_name=str(bot_name or bot_id or "bot"), chat=chat))
+        rows.extend(
+            self._serialize_messages(
+                messages=messages,
+                symbols=symbols,
+                encoder=encoder,
+                private_mode=False,
+                bot_id=str(bot_id or ""),
+                bot_name=str(bot_name or bot_id or "bot"),
+                chat=chat,
+            )
+        )
         rows.append("</CQCTX/3>")
         return "\n".join(rows)
 
-    def _build_dm(self, *, chat: ChatRef, bot_name: str, bot_id: str, messages: list[ContextMessageLine]) -> str:
-        symbols = self._collect_symbols(chat=chat, bot_name=bot_name, bot_id=bot_id, messages=messages)
+    def _build_dm(
+        self, *, chat: ChatRef, bot_name: str, bot_id: str, messages: list[ContextMessageLine]
+    ) -> str:
+        symbols = self._collect_symbols(
+            chat=chat, bot_name=bot_name, bot_id=bot_id, messages=messages
+        )
         peer_name = str(chat.user_id or "peer")
         for m in messages:
             if str(m.q or "") == str(chat.user_id or "") and str(m.u or "").strip():
                 peer_name = str(m.u)
                 break
-        rows: list[str] = [f"<CQDM/1 n:{len(messages)}>" ]
-        rows.append(f"P|me|{_cqctx_escape(str(bot_id or ''))}|{_cqctx_escape(str(bot_name or bot_id or 'bot'))}|bot")
-        rows.append(f"P|peer|{_cqctx_escape(str(chat.user_id or chat.chat_id or ''))}|{_cqctx_escape(peer_name)}")
+        rows: list[str] = [f"<CQDM/1 n:{len(messages)}>"]
+        rows.append(
+            f"P|me|{_cqctx_escape(str(bot_id or ''))}|{_cqctx_escape(str(bot_name or bot_id or 'bot'))}|bot"
+        )
+        rows.append(
+            f"P|peer|{_cqctx_escape(str(chat.user_id or chat.chat_id or ''))}|{_cqctx_escape(peer_name)}"
+        )
         for row in symbols.user_rows:
             qq_s = str(row.get("qq") or "")
             if qq_s in {str(bot_id or ""), str(chat.user_id or chat.chat_id or "")}:
                 continue
             suffix = "|bot" if row.get("bot") else ""
-            rows.append(f"U|{row['ref']}|{_cqctx_escape(row['qq'])}|{_cqctx_escape(row['name'])}{suffix}")
+            rows.append(
+                f"U|{row['ref']}|{_cqctx_escape(row['qq'])}|{_cqctx_escape(row['name'])}{suffix}"
+            )
         for row in symbols.image_rows:
             rows.append(f"I|{row['ref']}|{_cqctx_escape(row['filename'])}")
         encoder = _CQCtxBodyEncoder(symbols=symbols, is_group=False)
-        rows.extend(self._serialize_messages(messages=messages, symbols=symbols, encoder=encoder, private_mode=True, bot_id=str(bot_id or ""), bot_name=str(bot_name or bot_id or "bot"), chat=chat))
+        rows.extend(
+            self._serialize_messages(
+                messages=messages,
+                symbols=symbols,
+                encoder=encoder,
+                private_mode=True,
+                bot_id=str(bot_id or ""),
+                bot_name=str(bot_name or bot_id or "bot"),
+                chat=chat,
+            )
+        )
         rows.append("</CQDM/1>")
         return "\n".join(rows)
 
-    def _collect_symbols(self, *, chat: ChatRef, bot_name: str, bot_id: str, messages: list[ContextMessageLine]) -> _CQCtxSymbolTable:
+    def _collect_symbols(
+        self, *, chat: ChatRef, bot_name: str, bot_id: str, messages: list[ContextMessageLine]
+    ) -> _CQCtxSymbolTable:
         symbols = _CQCtxSymbolTable()
         if chat.chat_type == "group":
-            symbols.user_ref(qq=str(bot_id or "0"), name=str(bot_name or bot_id or "bot"), is_bot=True)
+            symbols.user_ref(
+                qq=str(bot_id or "0"), name=str(bot_name or bot_id or "bot"), is_bot=True
+            )
         else:
-            symbols.user_ref(qq=str(bot_id or "0"), name=str(bot_name or bot_id or "bot"), is_bot=True)
-            symbols.user_ref(qq=str(chat.user_id or chat.chat_id or "peer"), name=str(chat.user_id or chat.chat_id or "peer"))
+            symbols.user_ref(
+                qq=str(bot_id or "0"), name=str(bot_name or bot_id or "bot"), is_bot=True
+            )
+            symbols.user_ref(
+                qq=str(chat.user_id or chat.chat_id or "peer"),
+                name=str(chat.user_id or chat.chat_id or "peer"),
+            )
         for line in messages:
-            symbols.user_ref(qq=str(line.q or "0"), name=str(line.u or line.q or "unknown"), is_bot=bool(line.is_bot))
+            symbols.user_ref(
+                qq=str(line.q or "0"),
+                name=str(line.u or line.q or "unknown"),
+                is_bot=bool(line.is_bot),
+            )
             self._collect_line_assets(line=line, symbols=symbols)
         return symbols
 
@@ -729,10 +801,26 @@ class NapCatContextBuilderV2Impl:
             if filename:
                 symbols.image_ref(filename)
 
-    def _serialize_messages(self, *, messages: list[ContextMessageLine], symbols: _CQCtxSymbolTable, encoder: _CQCtxBodyEncoder, private_mode: bool, bot_id: str, bot_name: str, chat: ChatRef) -> list[str]:
+    def _serialize_messages(
+        self,
+        *,
+        messages: list[ContextMessageLine],
+        symbols: _CQCtxSymbolTable,
+        encoder: _CQCtxBodyEncoder,
+        private_mode: bool,
+        bot_id: str,
+        bot_name: str,
+        chat: ChatRef,
+    ) -> list[str]:
         rows: list[str] = []
         for line in messages:
-            sender_ref = self._sender_ref(line=line, symbols=symbols, private_mode=private_mode, bot_id=bot_id, peer_id=str(chat.user_id or chat.chat_id or ""))
+            sender_ref = self._sender_ref(
+                line=line,
+                symbols=symbols,
+                private_mode=private_mode,
+                bot_id=bot_id,
+                peer_id=str(chat.user_id or chat.chat_id or ""),
+            )
             body = encoder.encode(line.m)
             forward_rows: list[str] = []
             if line.f:
@@ -741,7 +829,11 @@ class NapCatContextBuilderV2Impl:
                     body = f"{body} [F:{fid}]".strip()
                 else:
                     body = f"[F:{fid}]"
-                summary = str((line.r or {}).get("forward_summary") or "").strip() if isinstance(line.r, dict) else ""
+                summary = (
+                    str((line.r or {}).get("forward_summary") or "").strip()
+                    if isinstance(line.r, dict)
+                    else ""
+                )
                 if not summary:
                     summary = str(getattr(line, "forward_summary", "") or "").strip()
                 summary_part = f"|{_cqctx_escape(summary)}" if summary else ""
@@ -754,7 +846,13 @@ class NapCatContextBuilderV2Impl:
                         node_ref_map[node_msg_id] = node_ref
                 for idx, node in enumerate(line.f):
                     node_ref = f"{fid}.{idx}"
-                    node_sender = self._node_sender_ref(node=node, symbols=symbols, private_mode=private_mode, bot_id=bot_id, peer_id=str(chat.user_id or chat.chat_id or ""))
+                    node_sender = self._node_sender_ref(
+                        node=node,
+                        symbols=symbols,
+                        private_mode=private_mode,
+                        bot_id=bot_id,
+                        peer_id=str(chat.user_id or chat.chat_id or ""),
+                    )
                     node_body = encoder.encode(str(node.get("m") or ""), node_ref_map=node_ref_map)
                     if private_mode:
                         src = str(node.get("src") or "").strip()
@@ -766,23 +864,44 @@ class NapCatContextBuilderV2Impl:
             rows.extend(forward_rows)
         return rows
 
-    def _sender_ref(self, *, line: ContextMessageLine, symbols: _CQCtxSymbolTable, private_mode: bool, bot_id: str, peer_id: str) -> str:
+    def _sender_ref(
+        self,
+        *,
+        line: ContextMessageLine,
+        symbols: _CQCtxSymbolTable,
+        private_mode: bool,
+        bot_id: str,
+        peer_id: str,
+    ) -> str:
         qq = str(line.q or "")
         if private_mode:
             if qq == str(bot_id or ""):
                 return "me"
             if qq == str(peer_id or ""):
                 return "peer"
-        return symbols.user_ref(qq=qq, name=str(line.u or qq or "unknown"), is_bot=bool(line.is_bot))
+        return symbols.user_ref(
+            qq=qq, name=str(line.u or qq or "unknown"), is_bot=bool(line.is_bot)
+        )
 
-    def _node_sender_ref(self, *, node: dict[str, Any], symbols: _CQCtxSymbolTable, private_mode: bool, bot_id: str, peer_id: str) -> str:
+    def _node_sender_ref(
+        self,
+        *,
+        node: dict[str, Any],
+        symbols: _CQCtxSymbolTable,
+        private_mode: bool,
+        bot_id: str,
+        peer_id: str,
+    ) -> str:
         qq = str(node.get("q") or "")
         if private_mode:
             if qq == str(bot_id or ""):
                 return "me"
             if qq == str(peer_id or ""):
                 return "peer"
-        return symbols.user_ref(qq=qq, name=str(node.get("u") or qq or "unknown"), is_bot=bool(node.get("bot")))
+        return symbols.user_ref(
+            qq=qq, name=str(node.get("u") or qq or "unknown"), is_bot=bool(node.get("bot"))
+        )
+
     """进程内存缓存（最小可用版）。
 
     目标：
@@ -824,7 +943,9 @@ class NapCatContextBuilderV2Impl:
     def _is_expired(self, ts: float) -> bool:
         return (self._now() - float(ts or 0.0)) > self._ttl_s
 
-    def _lru_get(self, store: "OrderedDict[str, dict[str, Any]]", key: str) -> dict[str, Any] | None:
+    def _lru_get(
+        self, store: "OrderedDict[str, dict[str, Any]]", key: str
+    ) -> dict[str, Any] | None:
         rec = store.get(key)
         if not isinstance(rec, dict):
             return None
@@ -842,7 +963,9 @@ class NapCatContextBuilderV2Impl:
             pass
         return rec
 
-    def _lru_put(self, store: "OrderedDict[str, dict[str, Any]]", key: str, rec: dict[str, Any], maxsize: int) -> None:
+    def _lru_put(
+        self, store: "OrderedDict[str, dict[str, Any]]", key: str, rec: dict[str, Any], maxsize: int
+    ) -> None:
         store[key] = rec
         try:
             store.move_to_end(key)
@@ -1053,11 +1176,13 @@ class NapCatMessageParserV2:
                 url = str(kv.get("url") or "").strip()
                 if url.startswith("https://"):
                     out.media.append(url)
-                    out.media_meta.append({
-                        "type": "image",
-                        "url": url,
-                        "file": str(kv.get("file") or kv.get("name") or "").strip(),
-                    })
+                    out.media_meta.append(
+                        {
+                            "type": "image",
+                            "url": url,
+                            "file": str(kv.get("file") or kv.get("name") or "").strip(),
+                        }
+                    )
 
             # 构建精简 CQ
             if seg_type == "text":
@@ -1067,7 +1192,9 @@ class NapCatMessageParserV2:
                 out.segments.append(ParsedSegment(type="text", data={"text": field_val}))
             else:
                 cq_str = (
-                    f"[CQ:{seg_type},{field_keys[0]}={field_val}]" if field_val else f"[CQ:{seg_type}]"
+                    f"[CQ:{seg_type},{field_keys[0]}={field_val}]"
+                    if field_val
+                    else f"[CQ:{seg_type}]"
                 )
                 parts_cq.append(cq_str)
                 out.segments.append(ParsedSegment(type=seg_type, data=kv))
@@ -1138,7 +1265,9 @@ class NapCatMessageParserV2:
                 out.segments.append(ParsedSegment(type="text", data={"text": field_val}))
             else:
                 cq_str = (
-                    f"[CQ:{seg_type},{field_keys[0]}={field_val}]" if field_val else f"[CQ:{seg_type}]"
+                    f"[CQ:{seg_type},{field_keys[0]}={field_val}]"
+                    if field_val
+                    else f"[CQ:{seg_type}]"
                 )
                 parts_cq.append(cq_str)
                 out.segments.append(ParsedSegment(type=seg_type, data=kv))
@@ -1171,7 +1300,11 @@ class NapCatMessageDetailFetcherV2:
             return ExpandedReply(id="")
 
         resp = await self._transport.call_action(ACTION_GET_MSG, {"message_id": mid}, timeout=10.0)
-        if not (isinstance(resp, dict) and resp.get("status") == "ok" and int(resp.get("retcode", -1)) == 0):
+        if not (
+            isinstance(resp, dict)
+            and resp.get("status") == "ok"
+            and int(resp.get("retcode", -1)) == 0
+        ):
             return ExpandedReply(id=mid)
 
         data = resp.get("data")
@@ -1218,7 +1351,11 @@ class NapCatMessageDetailFetcherV2:
             return ExpandedForward(id="")
 
         resp = await self._transport.call_action(ACTION_GET_FORWARD_MSG, {"id": fid}, timeout=15.0)
-        if not (isinstance(resp, dict) and resp.get("status") == "ok" and int(resp.get("retcode", -1)) == 0):
+        if not (
+            isinstance(resp, dict)
+            and resp.get("status") == "ok"
+            and int(resp.get("retcode", -1)) == 0
+        ):
             return ExpandedForward(id=fid)
 
         data = resp.get("data")
@@ -1239,7 +1376,9 @@ class NapCatMessageDetailFetcherV2:
                 m = m_raw
                 if getattr(self._transport, "config", None) is not None:
                     try:
-                        limit = int(getattr(self._transport.config, "context_message_max_chars", 0) or 0)
+                        limit = int(
+                            getattr(self._transport.config, "context_message_max_chars", 0) or 0
+                        )
                     except Exception:
                         limit = 0
                     if limit > 0 and len(m) > limit:
@@ -1277,13 +1416,15 @@ class NapCatMessageDetailFetcherV2:
                 limit = 0
             if limit > 0 and len(m) > limit:
                 m = m[:limit] + TRUNCATION_TAG
-            items.append({
-                "u": u,
-                "q": uid,
-                "id": str(node.get("message_id") or "").strip(),
-                "m": m,
-                "src": src,
-            })
+            items.append(
+                {
+                    "u": u,
+                    "q": uid,
+                    "id": str(node.get("message_id") or "").strip(),
+                    "m": m,
+                    "src": src,
+                }
+            )
             if parsed.media_meta:
                 media_meta.extend(list(parsed.media_meta))
 
@@ -1621,7 +1762,9 @@ class NapCatTransport:
         except Exception as e:
             logger.debug("napcat_ws get_login_info failed: {}", e)
 
-    async def call_action(self, action: str, params: dict[str, Any], timeout: float = 10.0) -> dict[str, Any]:
+    async def call_action(
+        self, action: str, params: dict[str, Any], timeout: float = 10.0
+    ) -> dict[str, Any]:
         """调用 OneBot action，并等待响应。"""
 
         if not self._ws:
@@ -1745,7 +1888,11 @@ def normalize_inbound(
         "raw_message": payload.get("raw_message"),
         "message_format": payload.get("message_format"),
     }
-    parsed_v2 = parser_v2.parse(payload=payload_like, self_id=str(self_id or "")) if parser_v2 else ParsedMessage()
+    parsed_v2 = (
+        parser_v2.parse(payload=payload_like, self_id=str(self_id or ""))
+        if parser_v2
+        else ParsedMessage()
+    )
 
     text = str(parsed_v2.plain_text or "").strip()
     rendered_text = str(parsed_v2.rendered_text or parsed_v2.cq_text or text or "").strip()
@@ -1782,7 +1929,6 @@ def normalize_inbound(
     )
 
 
-
 def _safe_media_filename(name: str) -> str:
     """把 OneBot/NapCat 的 file/name 变成可展示的安全文件名。"""
 
@@ -1812,7 +1958,6 @@ def _safe_media_filename(name: str) -> str:
         safe = safe[:180]
 
     return safe
-
 
 
 # ==============================
@@ -1894,7 +2039,9 @@ def _is_allowed_source(msg: NormalizedInbound, config: NapCatWSConfig) -> bool:
     return False
 
 
-def _is_reply_to_bot(msg: NormalizedInbound, *, store: V2SessionStore, session_key: str, self_id: str) -> bool:
+def _is_reply_to_bot(
+    msg: NormalizedInbound, *, store: V2SessionStore, session_key: str, self_id: str
+) -> bool:
     """判断 msg.reply 是否是在回复 bot。"""
 
     if not msg.reply or not msg.reply.message_id:
@@ -1920,11 +2067,15 @@ def _message_has_content(msg: NormalizedInbound) -> bool:
     )
 
 
-def _probability_for_message(msg: NormalizedInbound, config: NapCatWSConfig) -> tuple[float, TriggerType]:
+def _probability_for_message(
+    msg: NormalizedInbound, config: NapCatWSConfig
+) -> tuple[float, TriggerType]:
     """返回当前消息适用的概率及触发类型。"""
 
     if msg.chat.chat_type == "private":
-        return float(getattr(config, "private_trigger_probability", 0.0) or 0.0), "private_probability"
+        return float(
+            getattr(config, "private_trigger_probability", 0.0) or 0.0
+        ), "private_probability"
     return float(getattr(config, "group_trigger_probability", 0.0) or 0.0), "group_probability"
 
 
@@ -1954,7 +2105,11 @@ def decide_message_trigger(
         if gid in blk:
             return TriggerDecision(False, "blacklist_group")
 
-    if msg.chat.chat_type == "group" and getattr(config, "trigger_on_at", True) and bool(msg.at_self):
+    if (
+        msg.chat.chat_type == "group"
+        and getattr(config, "trigger_on_at", True)
+        and bool(msg.at_self)
+    ):
         return TriggerDecision(True, "at_bot", "at_bot")
 
     if getattr(config, "trigger_on_reply_to_bot", True) and _is_reply_to_bot(
@@ -1978,8 +2133,12 @@ def decide_message_trigger(
     seed = f"{session_key}|{msg.message_id}|{msg.sender_id}|{msg.timestamp.timestamp()}"
     sample = _stable_random_0_1(seed)
     if sample < probability:
-        return TriggerDecision(True, f"probability({sample:.3f}<{probability:.3f})", trigger, probability)
-    return TriggerDecision(False, f"probability({sample:.3f}>={probability:.3f})", trigger, probability)
+        return TriggerDecision(
+            True, f"probability({sample:.3f}<{probability:.3f})", trigger, probability
+        )
+    return TriggerDecision(
+        False, f"probability({sample:.3f}>={probability:.3f})", trigger, probability
+    )
 
 
 def decide_notice_trigger(
@@ -2063,38 +2222,60 @@ def validate_outbound_cq_text(content: str) -> CQValidationResult:
         if cq_type == "at":
             qq = str(params.get("qq") or "").strip()
             if not qq:
-                issues.append(CQValidationIssue("missing_required_param", "at 缺少 qq 参数", cq_text))
+                issues.append(
+                    CQValidationIssue("missing_required_param", "at 缺少 qq 参数", cq_text)
+                )
                 continue
             if qq != "all" and not qq.isdigit():
-                issues.append(CQValidationIssue("invalid_param_value", f"at.qq 非法: {qq}", cq_text))
+                issues.append(
+                    CQValidationIssue("invalid_param_value", f"at.qq 非法: {qq}", cq_text)
+                )
                 continue
             continue
 
         if cq_type == "reply":
             reply_id = str(params.get("id") or "").strip()
             if not reply_id:
-                issues.append(CQValidationIssue("missing_required_param", "reply 缺少 id 参数", cq_text))
+                issues.append(
+                    CQValidationIssue("missing_required_param", "reply 缺少 id 参数", cq_text)
+                )
                 continue
             continue
 
         if cq_type == "image":
             file_uri = str(params.get("file") or "").strip()
             if not file_uri:
-                issues.append(CQValidationIssue("missing_required_param", "image 缺少 file 参数", cq_text))
+                issues.append(
+                    CQValidationIssue("missing_required_param", "image 缺少 file 参数", cq_text)
+                )
                 continue
             local_path = _file_uri_to_local_path(file_uri)
             if not local_path:
-                issues.append(CQValidationIssue("invalid_param_value", f"image.file 必须是 file:// URI: {file_uri}", cq_text))
+                issues.append(
+                    CQValidationIssue(
+                        "invalid_param_value", f"image.file 必须是 file:// URI: {file_uri}", cq_text
+                    )
+                )
                 continue
             if not os.path.exists(local_path):
-                issues.append(CQValidationIssue("image_file_not_found", f"image.file 不存在: {local_path}", cq_text))
+                issues.append(
+                    CQValidationIssue(
+                        "image_file_not_found", f"image.file 不存在: {local_path}", cq_text
+                    )
+                )
                 continue
             if not os.path.isfile(local_path):
-                issues.append(CQValidationIssue("invalid_param_value", f"image.file 不是普通文件: {local_path}", cq_text))
+                issues.append(
+                    CQValidationIssue(
+                        "invalid_param_value", f"image.file 不是普通文件: {local_path}", cq_text
+                    )
+                )
                 continue
             continue
 
-        issues.append(CQValidationIssue("unsupported_cq_type", f"暂不支持的 CQ 类型: {cq_type}", cq_text))
+        issues.append(
+            CQValidationIssue("unsupported_cq_type", f"暂不支持的 CQ 类型: {cq_type}", cq_text)
+        )
 
     return CQValidationResult(valid=not issues, normalized_text=text, issues=issues)
 
@@ -2150,7 +2331,9 @@ class NapCatWSChannel(BaseChannel):
             reply_maxsize=V2_REPLY_CACHE_MAXSIZE,
             forward_maxsize=V2_FORWARD_CACHE_MAXSIZE,
         )
-        self._fetcher_v2 = NapCatMessageDetailFetcherV2(transport=self._transport, parser=self._parser_v2)
+        self._fetcher_v2 = NapCatMessageDetailFetcherV2(
+            transport=self._transport, parser=self._parser_v2
+        )
         self._ctx_builder_v2 = NapCatContextBuilderV2Impl()
 
         # 多次回复（multi-turn follow-up）任务容器：保留该能力，具体调度逻辑后续实现。
@@ -2232,7 +2415,9 @@ class NapCatWSChannel(BaseChannel):
                 raise RuntimeError("missing self_id")
 
             params = {"group_id": gid, "user_id": str(self._self_id), "no_cache": False}
-            resp = await self._transport.call_action(ACTION_GET_GROUP_MEMBER_INFO, params=params, timeout=10.0)
+            resp = await self._transport.call_action(
+                ACTION_GET_GROUP_MEMBER_INFO, params=params, timeout=10.0
+            )
             if isinstance(resp, dict) and resp.get("status") == "ok":
                 data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
                 if isinstance(data, dict):
@@ -2313,7 +2498,13 @@ class NapCatWSChannel(BaseChannel):
 
             # 已经是 URI（或 base64）则不动
             lower = file_val.lower()
-            if not file_val or lower.startswith("file://") or lower.startswith("http://") or lower.startswith("https://") or lower.startswith("base64://"):
+            if (
+                not file_val
+                or lower.startswith("file://")
+                or lower.startswith("http://")
+                or lower.startswith("https://")
+                or lower.startswith("base64://")
+            ):
                 out.append(cq_text)
                 pos = m.end()
                 continue
@@ -2384,7 +2575,9 @@ class NapCatWSChannel(BaseChannel):
         else:
             content = validation.normalized_text
 
-        action = "send_group_msg" if msg.metadata.get("chat_type") == "group" else "send_private_msg"
+        action = (
+            "send_group_msg" if msg.metadata.get("chat_type") == "group" else "send_private_msg"
+        )
 
         params: dict[str, Any] = {"message": content}
         if action == "send_group_msg":
@@ -2650,18 +2843,24 @@ class NapCatWSChannel(BaseChannel):
         # 1) 黑名单优先
         if chat.chat_type == "group":
             gid = str(chat.group_id)
-            blk_groups = set(str(x) for x in (getattr(self.config, "blacklist_group_ids", []) or []))
+            blk_groups = set(
+                str(x) for x in (getattr(self.config, "blacklist_group_ids", []) or [])
+            )
             if gid and gid in blk_groups:
                 logger.debug("napcat_ws notice ignored: blacklist_group ({})", gid)
                 return
         else:
-            blk_priv = set(str(x) for x in (getattr(self.config, "blacklist_private_ids", []) or []))
+            blk_priv = set(
+                str(x) for x in (getattr(self.config, "blacklist_private_ids", []) or [])
+            )
             if str(actor) in blk_priv:
                 logger.debug("napcat_ws notice ignored: blacklist_private ({})", actor)
                 return
 
         # 2) allowFrom
-        allow_list = [str(x) for x in (getattr(self.config, "allow_from", []) or []) if str(x).strip()]
+        allow_list = [
+            str(x) for x in (getattr(self.config, "allow_from", []) or []) if str(x).strip()
+        ]
         if allow_list and "*" not in allow_list:
             if chat.chat_type == "group":
                 gid = str(chat.group_id)
@@ -2760,12 +2959,9 @@ class NapCatWSChannel(BaseChannel):
     # message
     # ------------------------------
 
-
-
     # ------------------------------
     # V2: JSON lines 上下文（立刻启用）
     # ------------------------------
-
 
     async def _v2_build_line(self, msg: NormalizedInbound) -> ContextMessageLine:
         """把当前归一化消息投影成 V2 的 ContextMessageLine（含可选 r/f）。
@@ -2796,7 +2992,10 @@ class NapCatWSChannel(BaseChannel):
             "message_format": message_format,
         }
         parsed = self._parser_v2.parse(payload=payload_like, self_id=str(self._self_id or ""))
-        m_raw = parsed.cq_text or str(msg.raw_event.get("raw_message") or msg.rendered_text or msg.text or "").strip()
+        m_raw = (
+            parsed.cq_text
+            or str(msg.raw_event.get("raw_message") or msg.rendered_text or msg.text or "").strip()
+        )
         m = self._truncate_user_text(m_raw)
 
         line = ContextMessageLine(
@@ -2822,7 +3021,9 @@ class NapCatWSChannel(BaseChannel):
                     "raw_message": msg.reply.raw_message,
                     "message_format": "array" if isinstance(msg.reply.message, list) else "string",
                 }
-                pq = self._parser_v2.parse(payload=payload_like_quote, self_id=str(self._self_id or ""))
+                pq = self._parser_v2.parse(
+                    payload=payload_like_quote, self_id=str(self._self_id or "")
+                )
                 qm_raw = str(pq.cq_text or "").strip() or str(msg.reply.text or "").strip()
                 qm = self._truncate_user_text(qm_raw)
                 qu = str(msg.reply.sender_name or msg.reply.sender_id or "unknown")
@@ -2870,9 +3071,13 @@ class NapCatWSChannel(BaseChannel):
                     payload_like_node = {
                         "message": it.get("message"),
                         "raw_message": it.get("raw_message"),
-                        "message_format": "array" if isinstance(it.get("message"), list) else "string",
+                        "message_format": "array"
+                        if isinstance(it.get("message"), list)
+                        else "string",
                     }
-                    parsed_node = self._parser_v2.parse(payload=payload_like_node, self_id=str(self._self_id or ""))
+                    parsed_node = self._parser_v2.parse(
+                        payload=payload_like_node, self_id=str(self._self_id or "")
+                    )
                     t2 = str(parsed_node.cq_text or "").strip()
                     if not t2:
                         t2 = str(it.get("text") or "").strip()
@@ -2880,16 +3085,20 @@ class NapCatWSChannel(BaseChannel):
                     t2 = self._truncate_user_text(t2)
 
                     if t2:
-                        items_v2.append({
-                            "u": u2,
-                            "q": q2,
-                            "id": str(it.get("message_id") or "").strip(),
-                            "m": t2,
-                            "src": str(it.get("src") or "").strip(),
-                            "media_paths": list(it.get("media_paths") or []),
-                        })
+                        items_v2.append(
+                            {
+                                "u": u2,
+                                "q": q2,
+                                "id": str(it.get("message_id") or "").strip(),
+                                "m": t2,
+                                "src": str(it.get("src") or "").strip(),
+                                "media_paths": list(it.get("media_paths") or []),
+                            }
+                        )
 
-                fexp = ExpandedForward(id=fid, items=items_v2, summary=str(msg.forward_summary or ""))
+                fexp = ExpandedForward(
+                    id=fid, items=items_v2, summary=str(msg.forward_summary or "")
+                )
                 # 写入 cache，避免后续重复
                 try:
                     self._cache_v2.put_forward(fid, fexp)
@@ -2899,7 +3108,9 @@ class NapCatWSChannel(BaseChannel):
                 try:
                     fexp = await self._cache_v2.get_or_fetch_forward(
                         forward_id=fid,
-                        fetch=lambda: self._fetcher_v2.expand_forward(forward_id=fid, chat=msg.chat),
+                        fetch=lambda: self._fetcher_v2.expand_forward(
+                            forward_id=fid, chat=msg.chat
+                        ),
                     )
                 except Exception:
                     fexp = None
@@ -2909,7 +3120,9 @@ class NapCatWSChannel(BaseChannel):
 
         return line
 
-    def _build_chat_context_v2(self, *, msg: NormalizedInbound, session_key: str, bot_name: str) -> str:
+    def _build_chat_context_v2(
+        self, *, msg: NormalizedInbound, session_key: str, bot_name: str
+    ) -> str:
         hist_limit = int(getattr(self.config, "context_max_messages", 20) or 20)
         hist = self._store.recent_messages(session_key, hist_limit)
 
@@ -2945,7 +3158,7 @@ class NapCatWSChannel(BaseChannel):
             for it in msg.forward_items:
                 if not isinstance(it, dict):
                     continue
-                for p in (it.get("media_paths") or []):
+                for p in it.get("media_paths") or []:
                     if isinstance(p, str) and p and p not in msg.media_paths:
                         msg.media_paths.append(p)
         except Exception:
@@ -2961,7 +3174,6 @@ class NapCatWSChannel(BaseChannel):
             session_key=session_key,
             self_id=str(self._self_id or ""),
         )
-
 
         # V2: 始终缓存一条 JSON line（用于构建 <NAPCAT_WS_CONTEXT>）
         try:
@@ -3008,12 +3220,16 @@ class NapCatWSChannel(BaseChannel):
         # 1) 黑名单优先（防御性：即使上游 trigger 决策已做过黑名单判断，这里仍再次确保）
         if msg.chat.chat_type == "group":
             gid = str(msg.chat.group_id)
-            blk_groups = set(str(x) for x in (getattr(self.config, "blacklist_group_ids", []) or []))
+            blk_groups = set(
+                str(x) for x in (getattr(self.config, "blacklist_group_ids", []) or [])
+            )
             if gid and gid in blk_groups:
                 logger.debug("napcat_ws message ignored: blacklist_group ({})", gid)
                 return
         else:
-            blk_priv = set(str(x) for x in (getattr(self.config, "blacklist_private_ids", []) or []))
+            blk_priv = set(
+                str(x) for x in (getattr(self.config, "blacklist_private_ids", []) or [])
+            )
             # 私聊场景：屏蔽 user_id（即 sender_id）
             if str(msg.sender_id) in blk_priv:
                 logger.debug("napcat_ws message ignored: blacklist_private ({})", msg.sender_id)
@@ -3022,7 +3238,9 @@ class NapCatWSChannel(BaseChannel):
         # 2) allowFrom 白名单：支持 user_id 或 group_id。
         #    约定：allowFrom 为空 → 不限制；包含 "*" → 全允许。
         #    不做 fallback：群聊只用 group_id，私聊只用 sender_id。
-        allow_list = [str(x) for x in (getattr(self.config, "allow_from", []) or []) if str(x).strip()]
+        allow_list = [
+            str(x) for x in (getattr(self.config, "allow_from", []) or []) if str(x).strip()
+        ]
         if allow_list and "*" not in allow_list:
             if msg.chat.chat_type == "group":
                 gid = str(msg.chat.group_id)
@@ -3061,7 +3279,7 @@ class NapCatWSChannel(BaseChannel):
         # - 历史窗口图片：来自 store 里 ContextMessageLine.media_paths（不写入上下文文本，仅用于本轮 media 合并）
         merged_media: list[str] = []
         try:
-            for p in (msg.media_paths or []):
+            for p in msg.media_paths or []:
                 if isinstance(p, str) and p and p not in merged_media:
                     merged_media.append(p)
         except Exception:
@@ -3069,7 +3287,7 @@ class NapCatWSChannel(BaseChannel):
 
         try:
             if msg.reply is not None:
-                for p in (msg.reply.media_paths or []):
+                for p in msg.reply.media_paths or []:
                     if isinstance(p, str) and p and p not in merged_media:
                         merged_media.append(p)
         except Exception:
@@ -3079,7 +3297,7 @@ class NapCatWSChannel(BaseChannel):
             hist_limit = int(getattr(self.config, "context_max_messages", 20) or 20)
             hist = self._store.recent_messages(session_key, hist_limit)
             for line in hist:
-                for p in (getattr(line, "media_paths", None) or []):
+                for p in getattr(line, "media_paths", None) or []:
                     if isinstance(p, str) and p and p not in merged_media:
                         merged_media.append(p)
         except Exception:
@@ -3170,7 +3388,7 @@ class NapCatWSChannel(BaseChannel):
                 for it in msg.reply.forward_items or []:
                     if not isinstance(it, dict):
                         continue
-                    for p in (it.get("media_paths") or []):
+                    for p in it.get("media_paths") or []:
                         if isinstance(p, str) and p and p not in msg.reply.media_paths:
                             msg.reply.media_paths.append(p)
             except Exception:
@@ -3265,7 +3483,9 @@ class NapCatWSChannel(BaseChannel):
     def _parse_payload_message(self, *, message: Any, raw: Any = None) -> ParsedMessage:
         payload_msg = message if message not in (None, "") else raw
         message_format = (
-            "array" if isinstance(payload_msg, list) else ("string" if isinstance(payload_msg, str) else None)
+            "array"
+            if isinstance(payload_msg, list)
+            else ("string" if isinstance(payload_msg, str) else None)
         )
         payload_like = {
             "message": payload_msg,
@@ -3274,9 +3494,13 @@ class NapCatWSChannel(BaseChannel):
         }
         return self._parser_v2.parse(payload=payload_like, self_id=str(self._self_id or ""))
 
-    def _render_text_and_media(self, *, message: Any, raw: Any) -> tuple[str, list[str], list[dict[str, Any]]]:
+    def _render_text_and_media(
+        self, *, message: Any, raw: Any
+    ) -> tuple[str, list[str], list[dict[str, Any]]]:
         parsed = self._parse_payload_message(message=message, raw=raw)
-        effective_text = str(parsed.rendered_text or parsed.cq_text or parsed.plain_text or "").strip()
+        effective_text = str(
+            parsed.rendered_text or parsed.cq_text or parsed.plain_text or ""
+        ).strip()
         media = list(parsed.media or [])
         media_meta = list(parsed.media_meta or [])
         return effective_text, media, media_meta
@@ -3447,7 +3671,6 @@ class NapCatWSChannel(BaseChannel):
     # store & logging
     # ------------------------------
 
-
     def _log_inbound(self, msg: NormalizedInbound) -> None:
         reply_id = msg.reply.message_id if msg.reply else ""
         forward_id = msg.forward_id or ""
@@ -3555,5 +3778,3 @@ class NapCatWSChannel(BaseChannel):
 
 # 向后兼容导出（如果旧代码用 from ... import NapCatWSChannel）
 __all__ = ["NapCatWSChannel"]
-
-
