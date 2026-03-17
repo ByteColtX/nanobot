@@ -177,9 +177,12 @@ class NapCatWSConfig(Base):
     session_buffer_size: int = Field(default=50, description="内存会话环形缓冲区大小")
 
     # --- 输入整形 ---
-    user_text_truncate_chars: int = Field(
+    context_message_max_chars: int = Field(
         default=200,
-        description="用户文本过长时的截断长度，用于避免上下文变得难读",
+        description=(
+            "单条上下文消息文本的最大字符数（按消息逐条截断）。超过则截断并追加 <TRUNCATED>。"
+            "0/负数表示不截断。"
+        ),
     )
     ignore_self_messages: bool = Field(
         default=True,
@@ -959,7 +962,7 @@ class NapCatMessageDetailFetcherV2:
                 m = m_raw
                 if getattr(self._transport, "config", None) is not None:
                     try:
-                        limit = int(getattr(self._transport.config, "user_text_truncate_chars", 0) or 0)
+                        limit = int(getattr(self._transport.config, "context_message_max_chars", 0) or 0)
                     except Exception:
                         limit = 0
                     if limit > 0 and len(m) > limit:
@@ -988,7 +991,7 @@ class NapCatMessageDetailFetcherV2:
             m_raw = parsed.cq_text or str(node.get("raw_message") or "").strip()
             m = m_raw
             try:
-                limit = int(getattr(self._transport.config, "user_text_truncate_chars", 0) or 0)
+                limit = int(getattr(self._transport.config, "context_message_max_chars", 0) or 0)
             except Exception:
                 limit = 0
             if limit > 0 and len(m) > limit:
@@ -1909,14 +1912,14 @@ class NapCatWSChannel(BaseChannel):
     def _truncate_user_text(self, s: str) -> str:
         """Truncate a single user message to keep context readable.
 
-        Rule (per config.user_text_truncate_chars):
+        Rule (per config.context_message_max_chars):
         - limit <= 0: no truncation
         - len(text) > limit: text[:limit] + TRUNCATION_TAG
 
         NOTE: This is for context/input shaping only (not for outbound bot replies).
         """
 
-        limit = int(getattr(self.config, "user_text_truncate_chars", 0) or 0)
+        limit = int(getattr(self.config, "context_message_max_chars", 0) or 0)
         text = str(s or "")
         if limit <= 0:
             return text
