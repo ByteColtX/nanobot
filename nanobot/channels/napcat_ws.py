@@ -1,50 +1,33 @@
 """NapCat Forward WebSocket 渠道（OneBot v11）。
 
-本文件采用“单文件分层架构”：NapCat WebSocket 渠道相关的 transport、入站、
-会话上下文、出站逻辑都集中在 napcat_ws.py 中维护，但职责边界必须清晰。
+这个文件保持单文件实现，但按 section 分层维护，避免职责混在一起。
 
-当前架构（都在本文件内）：
-- Transport 层：WebSocket 连接管理、OneBot action 调用、echo/future 关联、任务生命周期。
-- Inbound 层：原始 OneBot/NapCat payload 归一化，V2 parser 负责消息内容语义解析。
-- Policy 层：只负责“是否响应”的触发决策，不负责回复风格控制。
-- Session / Context 层：基于归一化消息、reply/forward 展开、历史消息构建聊天上下文。
-- Outbound 层：以文本为主载体发送消息，允许文本中内嵌 CQ 码，并在发送前做轻量校验。
+当前边界：
+- Transport：WebSocket 连接、action 调用、echo/future 关联、任务生命周期。
+- Inbound：原始 payload 归一化、消息解析、reply/forward/media 补全。
+- Policy：只判断“要不要响应”，不管回复风格。
+- Session / Context：维护会话缓存并构建聊天上下文。
+- Outbound：负责发送文本/CQ，不负责拼 system prompt 或人格。
 
-Policy 当前支持的触发方式：
-- 私聊概率触发。
-- 群聊概率触发。
-- 昵称触发（命中配置列表中的任一昵称即触发）。
-- 戳一戳触发。
-- @机器人触发。
-- 回复机器人触发。
+当前支持的主要触发：
+- 私聊概率触发
+- 群聊概率触发
+- nickname trigger
+- poke trigger
+- @bot trigger
+- reply-to-bot trigger
 
-Outbound 当前设计：
-- 出站主路径是 text-first，而不是复杂 segment builder。
-- 模型可以直接生成 CQ 码出站；当前正式支持校验的 CQ 类型：at、reply、image。
-- 发送前会执行轻量校验：
-  - at.qq 必须为数字字符串或 all。
-  - reply.id 必须非空。
-  - image.file 必须是存在的本地 file:// 普通文件路径。
-- 暂不支持的 CQ 类型不会静默透传到主链路。
-- 未来可扩展的出站类型包括：record、video 等。
-
-边界约束：
-- channel 层只提供“聊天上下文”，即 <NAPCAT_WS_CONTEXT> 所需内容。
-- system prompt、人格、全局行为规则不在这里拼装；它们由统一 Agent Context 注入。
-- Inbound 与 Outbound 是非对称设计：Inbound 负责结构化理解，Outbound 负责 CQ-first 文本发送。
-- 因此本文件不应承担完整模型输入/前置 prompt 组装职责。
-
-已移除/不再保留的旧设计：
-- legacy parser 主链路。
-- smalltalk_*、longform_* 等旧配置与模式切换逻辑。
-- 旧 prompt-builder / mode-based reply shaping。
+当前 Outbound 设计：
+- 走 text-first 主路径，不做复杂 segment builder。
+- 允许模型直接输出 CQ 码；当前正式校验的 CQ 类型：at、reply、image。
+- 发送前只做轻量校验，避免脏 CQ 直接进入主链路。
 
 维护约定：
-- 修改消息解析时优先看 Inbound。
-- 修改触发规则时优先看 Policy。
-- 修改聊天上下文时看 Session / Context。
-- 修改发送行为时看 Outbound。
-- 新功能优先接入当前主链路，不要把旧实现重新带回本文件。
+- 改消息解析，优先看 Inbound。
+- 改触发规则，优先看 Policy。
+- 改上下文构建，优先看 Session / Context。
+- 改发送行为，优先看 Outbound。
+- 新逻辑优先接当前主链路，不要把 legacy 实现带回。
 """
 
 from __future__ import annotations
