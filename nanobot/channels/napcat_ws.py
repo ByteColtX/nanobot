@@ -95,7 +95,7 @@ def summarize_onebot_event(payload: dict[str, Any]) -> str:
     return " ".join(parts) if parts else "empty_payload"
 
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir
@@ -112,7 +112,7 @@ class NapCatWSConfig(Base):
     - 每个 channel 自己维护字段与默认值，方便演进，也方便清理死字段。
 
     配置路径：
-        config.channels.napcatWs
+        config.channels.napcat_ws
 
     命名规则：
     - Python 字段使用 snake_case。
@@ -2245,9 +2245,45 @@ class NapCatWSChannel(BaseChannel):
             bot_name=bot_name,
         )
 
-        await super()._handle_message(
+        # allowFrom 语义（NapCatWS 扩展）：支持 user_id 或 group_id（群聊只用 group_id，不做 fallback）
+        # 1) 黑名单优先
+        if chat.chat_type == "group":
+            gid = str(chat.group_id)
+            blk_groups = set(str(x) for x in (getattr(self.config, "blacklist_group_ids", []) or []))
+            if gid and gid in blk_groups:
+                logger.debug("napcat_ws notice ignored: blacklist_group ({})", gid)
+                return
+        else:
+            blk_priv = set(str(x) for x in (getattr(self.config, "blacklist_private_ids", []) or []))
+            if str(actor) in blk_priv:
+                logger.debug("napcat_ws notice ignored: blacklist_private ({})", actor)
+                return
+
+        # 2) allowFrom
+        allow_list = [str(x) for x in (getattr(self.config, "allow_from", []) or []) if str(x).strip()]
+        if allow_list and "*" not in allow_list:
+            if chat.chat_type == "group":
+                gid = str(chat.group_id)
+                if not gid or gid not in allow_list:
+                    logger.warning(
+                        "Access denied for group_id {} on channel {}. Add this group_id to allowFrom list.",
+                        gid or "(empty)",
+                        self.name,
+                    )
+                    return
+            else:
+                if str(actor) not in allow_list:
+                    logger.warning(
+                        "Access denied for sender {} on channel {}. Add them to allowFrom list.",
+                        actor,
+                        self.name,
+                    )
+                    return
+
+        inbound = InboundMessage(
+            channel=self.name,
             sender_id=str(actor),
-            chat_id=chat.chat_id,
+            chat_id=str(chat.chat_id),
             content=content,
             media=[],
             metadata={
@@ -2260,8 +2296,10 @@ class NapCatWSChannel(BaseChannel):
                 "_napcat_trigger": decision.trigger,
                 "_napcat_trigger_reason": decision.reason,
             },
-            session_key=session_key,
+            session_key_override=session_key,
         )
+        await self.bus.publish_inbound(inbound)
+        return
 
     def _extract_notice_actor_name(self, payload: dict[str, Any], fallback: str) -> str:
         """Best-effort actor display name for notice events (no network calls)."""
@@ -2524,31 +2562,40 @@ class NapCatWSChannel(BaseChannel):
 
         # 1) 黑名单优先（防御性：即使上游 trigger 决策已做过黑名单判断，这里仍再次确保）
         if msg.chat.chat_type == "group":
-            gid = str(msg.chat.group_id or msg.chat.chat_id)
+            gid = str(msg.chat.group_id)
             blk_groups = set(str(x) for x in (getattr(self.config, "blacklist_group_ids", []) or []))
-            if gid in blk_groups:
+            if gid and gid in blk_groups:
                 logger.debug("napcat_ws message ignored: blacklist_group ({})", gid)
                 return
         else:
             blk_priv = set(str(x) for x in (getattr(self.config, "blacklist_private_ids", []) or []))
-            # 私聊场景：既屏蔽 user_id，也屏蔽 chat_id（通常相同，但保留兼容）
-            if str(msg.sender_id) in blk_priv or str(msg.chat.chat_id) in blk_priv:
+            # 私聊场景：屏蔽 user_id（即 sender_id）
+            if str(msg.sender_id) in blk_priv:
                 logger.debug("napcat_ws message ignored: blacklist_private ({})", msg.sender_id)
                 return
 
-        # 2) allowFrom 白名单（为空 → 不限制；包含 * → 全允许）
+        # 2) allowFrom 白名单：支持 user_id 或 group_id。
+        #    约定：allowFrom 为空 → 不限制；包含 "*" → 全允许。
+        #    不做 fallback：群聊只用 group_id，私聊只用 sender_id。
         allow_list = [str(x) for x in (getattr(self.config, "allow_from", []) or []) if str(x).strip()]
         if allow_list and "*" not in allow_list:
-            sender_ok = str(msg.sender_id) in allow_list
-            chat_ok = (msg.chat.chat_type == "group" and str(msg.chat.group_id) in allow_list)
-            if not (sender_ok or chat_ok):
-                logger.warning(
-                    "Access denied for sender {} on channel {}. Add them or the group_id({}) to allowFrom list.",
-                    msg.sender_id,
-                    self.name,
-                    msg.chat.chat_id,
-                )
-                return
+            if msg.chat.chat_type == "group":
+                gid = str(msg.chat.group_id)
+                if not gid or gid not in allow_list:
+                    logger.warning(
+                        "Access denied for group_id {} on channel {}. Add this group_id to allowFrom list.",
+                        gid or "(empty)",
+                        self.name,
+                    )
+                    return
+            else:
+                if str(msg.sender_id) not in allow_list:
+                    logger.warning(
+                        "Access denied for sender {} on channel {}. Add them to allowFrom list.",
+                        msg.sender_id,
+                        self.name,
+                    )
+                    return
 
         bot_name = ""
         try:
@@ -2564,9 +2611,12 @@ class NapCatWSChannel(BaseChannel):
         )
 
         # 交给 agent（MessageBus）生成回复；NapCat 的 send() 会把 OutboundMessage 发回平台
-        await super()._handle_message(
-            sender_id=msg.sender_id,
-            chat_id=msg.chat.chat_id,
+        # 注意：群聊白名单是 group_id 级别的，BaseChannel 的 sender_id allowlist 无法表达。
+        # 因此这里不再调用 super()._handle_message()，而是直接 publish inbound。
+        inbound = InboundMessage(
+            channel=self.name,
+            sender_id=str(msg.sender_id),
+            chat_id=str(msg.chat.chat_id),
             content=content,
             media=msg.media or [],
             metadata={
@@ -2578,8 +2628,10 @@ class NapCatWSChannel(BaseChannel):
                 "_napcat_trigger": decision.trigger,
                 "_napcat_trigger_reason": decision.reason,
             },
-            session_key=session_key,
+            session_key_override=session_key,
         )
+        await self.bus.publish_inbound(inbound)
+        return
 
     async def _expand_quote(self, msg: NormalizedInbound) -> None:
         if msg.reply is None or not msg.reply.message_id:
