@@ -95,94 +95,83 @@ from pydantic import Field
 
 
 class NapCatWSConfig(Base):
-    """NapCat WS 渠道配置（按 Telegram 渠道的模式：配置模型放在各自的 channel 文件里）。
+    """NapCat WS 渠道配置。
 
-    为什么放在这里：
-    - 上游的 `nanobot/config/schema.py` 保持干净（channels 配置允许 extra）。
-    - 每个 channel 自己维护字段与默认值，方便演进，也方便清理死字段。
+    配置路径：`config.channels.napcat_ws`
 
-    配置路径：
-        config.channels.napcat_ws
-
-    命名规则：
-    - Python 字段使用 snake_case。
-    - 配置文件既可以用 snake_case（例如 `poke_cooldown_seconds`），也可以用 camelCase
-      （例如 `pokeCooldownSeconds`、`privateTriggerProbability`），具体取决于 Base 的 alias 规则。
+    说明：
+    - 字段定义放在 channel 文件内，便于跟实现一起演进。
+    - Python 字段名用 snake_case。
+    - 配置文件可同时兼容 snake_case / camelCase，具体取决于 Base 的 alias 规则。
     """
 
     # --- 连接 ---
     enabled: bool = Field(default=False, description="是否启用 NapCatWS 渠道")
     url: str = Field(default="", description="WebSocket 地址，例如 ws://localhost:3001/")
-    token: str = Field(default="", description="NapCat/OneBot 的 token（如果服务端要求）")
+    token: str = Field(default="", description="NapCat / OneBot token（如果服务端要求）")
 
-    # --- 白名单 / 黑名单 ---
+    # --- 来源控制 ---
     allow_from: list[str] = Field(
         default_factory=list,
         description=(
             "允许触发的来源列表（字符串）。\n"
-            "支持两种用法：\n"
-            "- 填 user_id：允许指定用户（私聊/群内发言者）\n"
-            "- 填 group_id：允许指定群（群内任何人都可触发）\n"
-            "为空表示不做白名单限制（全部允许），仍会受黑名单影响。"
+            "支持两种值：\n"
+            "- user_id：允许指定用户（私聊 / 群内发言者）\n"
+            "- group_id：允许指定群\n"
+            "为空表示不启用 allow list，仍会受 blacklist 影响。"
         ),
     )
     blacklist_private_ids: list[str] = Field(
         default_factory=list,
-        description="私聊黑名单 user_id 列表（字符串）",
+        description="私聊 blacklist user_id 列表",
     )
     blacklist_group_ids: list[str] = Field(
         default_factory=list,
-        description="群聊黑名单 group_id 列表（字符串）",
+        description="群聊 blacklist group_id 列表",
     )
 
     # --- 概率触发 ---
     private_trigger_probability: float = Field(
         default=0.05,
-        description="私聊随机触发概率（0~1），默认 0.05",
+        description="私聊随机触发概率（0~1）",
     )
     group_trigger_probability: float = Field(
         default=0.05,
-        description="群聊随机触发概率（0~1），默认 0.05",
+        description="群聊随机触发概率（0~1）",
     )
 
-    # --- 昵称/关键词触发 ---
+    # --- 直接触发 ---
     nickname_triggers: list[str] = Field(
         default_factory=list,
-        description="消息中包含任一昵称/关键词即触发",
+        description="消息中包含任一 nickname / keyword 即触发",
     )
-
-    # --- Notice 触发（系统通知类） ---
-    trigger_on_poke: bool = Field(default=False, description="收到戳一戳（poke）通知时触发")
+    trigger_on_at: bool = Field(default=True, description="群聊中 @ 机器人时触发")
+    trigger_on_reply_to_bot: bool = Field(default=True, description="引用回复机器人消息时触发")
+    trigger_on_poke: bool = Field(default=False, description="收到 poke 通知时触发")
     poke_cooldown_seconds: int = Field(
         default=60,
-        description="戳一戳触发冷却（秒）。<=0 表示关闭冷却。默认 60 秒。",
+        description="poke 触发冷却秒数；<=0 表示关闭冷却",
     )
 
-    # --- 关系触发（@ / 回复） ---
-    trigger_on_at: bool = Field(default=True, description="群聊中 @ 机器人时触发")
-    trigger_on_reply_to_bot: bool = Field(default=True, description="回复机器人消息时触发")
-
-    # --- 上下文 / 会话限制 ---
+    # --- 上下文 / 会话 ---
     context_max_messages: int = Field(default=25, description="构建上下文时最多读取的消息条数")
-    session_buffer_size: int = Field(default=50, description="内存会话环形缓冲区大小")
-
-    # --- 输入整形 ---
+    session_buffer_size: int = Field(default=50, description="内存会话 ring buffer 大小")
     context_message_max_chars: int = Field(
         default=200,
         description=(
-            "单条上下文消息文本的最大字符数（按消息逐条截断）。超过则截断并追加 <TRUNCATED>。"
-            "0/负数表示不截断。"
+            "单条上下文消息的最大字符数。超过则截断并追加 <TRUNCATED>；"
+            "0 或负数表示不截断。"
         ),
     )
     ignore_self_messages: bool = Field(
         default=True,
-        description="忽略机器人自身发送的消息，避免自我回声/死循环",
+        description="忽略机器人自身消息，避免自回声 / 死循环",
     )
 
     # --- 多轮回复 ---
     multi_turn_max_replies: int = Field(
         default=3,
-        description="一次多轮追问中最多连续回复的次数",
+        description="一次多轮回复最多连续发送的条数",
     )
 
 # NOTE: transport层也会用到 OneBot action 常量（get_login_info）
@@ -199,7 +188,7 @@ except ImportError:  # pragma: no cover
 
 
 # ==============================
-# 1) Types & constants（类型与常量）
+# 1) Types & constants
 # ==============================
 
 ChatType = Literal["private", "group"]
@@ -207,31 +196,30 @@ TriggerType = Literal["private_probability", "group_probability", "nickname", "p
 
 NoticeKind = Literal["poke", "other_notice"]
 
-# OneBot/NapCat action names（集中管理，避免散落 magic string）
+# OneBot / NapCat action 名
 ACTION_GET_LOGIN_INFO = "get_login_info"
 ACTION_GET_MSG = "get_msg"
 ACTION_GET_FORWARD_MSG = "get_forward_msg"
 ACTION_GET_GROUP_MEMBER_INFO = "get_group_member_info"
 ACTION_SEND_POKE = "send_poke"
 
-# Cache TTL defaults (seconds). Keep visible.
+# Cache TTL（秒）
 CACHE_TTL_1D_SECONDS = 60 * 60 * 24
-DEFAULT_CACHE_TTL_SECONDS = CACHE_TTL_1D_SECONDS  # default: 1d
+DEFAULT_CACHE_TTL_SECONDS = CACHE_TTL_1D_SECONDS
 
-# V2 cache max sizes (entries). Keep visible.
+# V2 cache 上限
 V2_REPLY_CACHE_MAXSIZE = 2048
 V2_FORWARD_CACHE_MAXSIZE = 1024
 
 
-TRUNCATION_TAG = "<TRUNCATED>"  # 固定截断标签：在 Prompt/Context 层前置说明其含义
-NO_REPLY_TAG = "<NO_REPLY>"  # 模型返回该标签表示不回复（channel 层应直接跳过发送）
-NO_FOLLOWUP_TAG = "<NO_FOLLOWUP>"  # 模型返回该标签表示不进行后续多次回复
-
+TRUNCATION_TAG = "<TRUNCATED>"  # 固定截断标记
+NO_REPLY_TAG = "<NO_REPLY>"  # 主回复不发送
+NO_FOLLOWUP_TAG = "<NO_FOLLOWUP>"  # 不继续 follow-up
 
 
 @dataclass(slots=True)
 class CQCtxReverseMap:
-    """短记号 -> 原始平台标识/文件名 的反向映射预留接口。"""
+    """短记号到原始平台标识 / 文件名的反向映射。"""
 
     users: dict[str, dict[str, str]] = field(default_factory=dict)
     images: dict[str, str] = field(default_factory=dict)
@@ -290,14 +278,7 @@ class InMemoryMessageCache:
 
 @dataclass(slots=True)
 class ChatRef:
-    """归一化后的聊天定位信息。
-
-    字段说明：
-        chat_type: "private" 或 "group"。
-        chat_id: 该会话的主键：私聊=对方 user_id；群聊=group_id。
-        user_id: 发送者 user_id（如果可得）。
-        group_id: 群号（如果可得）。
-    """
+    """归一化后的聊天定位信息。"""
 
     chat_type: ChatType
     chat_id: str
@@ -327,7 +308,7 @@ class QuotedMessage:
 
 @dataclass(slots=True)
 class NormalizedInbound:
-    """Normalize 层输出的内部消息结构，供 Policy/Context 使用。"""
+    """Normalize 层产出的内部消息结构，供 Policy / Context 使用。"""
 
     chat: ChatRef
     sender_id: str
@@ -386,12 +367,9 @@ class CQValidationResult:
 
 
 # =========================================
-# 1.1) Inbound V2 types（segments/expansions/context line）
+# 1.1) Inbound V2 types
 # =========================================
-#
-# 说明：
-#   - Inbound 主链路只使用 V2（下面 1.1.1 的实现区）。
-#   - 这里保留 V2 解析/展开/上下文所需的最小数据结构定义。
+# 这里只放 V2 解析 / 展开 / 上下文构建需要的数据结构。
 
 
 MessageSegmentType = Literal[
@@ -409,14 +387,13 @@ MessageSegmentType = Literal[
 
 @dataclass(slots=True)
 class ParsedSegment:
-    """消息片段（segment）的轻量归一化表示。
+    """segment 的轻量归一化表示。
 
-    这不是最终渲染结果。该结构存在的目的，是让后续渲染器/上下文构建器可以稳定地产出：
-      - CQ 风格的 `m` 文本（用于 <NAPCAT_WS_CONTEXT> 的 `m` 字段）
-      - 触发用的纯文本（通常由 ParsedMessage.plain_text 提供）
-      - 各类引用信号：reply_id / forward_id / at_qq 等
-
-    注意：这里只定义数据结构；解析逻辑后续实现。
+    这里只存解析结果，不负责最终渲染。
+    后续渲染 / 上下文构建会基于它生成：
+    - 上下文里的 `m` 文本
+    - 触发匹配用的纯文本
+    - reply / forward / at 等信号
     """
 
     type: MessageSegmentType
@@ -427,17 +404,7 @@ class ParsedSegment:
 class ParsedMessage:
     """消息解析后的统一输出。
 
-    字段约定：
-      - segments：仅保留当前阶段支持的 segment 类型（见 MessageSegmentType）
-      - plain_text：用于触发/策略匹配的纯文本
-      - cq_text：用于上下文 `m` 字段的 CQ 风格文本（尽量接近 OneBot/CQ 表达）
-      - rendered_text：面向聊天上下文/人类可读的渲染文本（图片/语音等保留占位）
-      - rendered_segments：渲染后的片段摘要序列
-      - media：从消息中提取出的媒体引用（当前以 URL 为主）
-      - media_meta：结构化媒体元数据，供下载/诊断/上下文构建复用
-      - at_qq/reply_id/forward_id：用于后续“引用展开/转发展开/@昵称映射”的信号
-
-    注意：这里只定义数据结构；生产级解析逻辑后续实现。
+    这里只存解析结果，供后续 trigger / expand / context 构建复用。
     """
 
     segments: list[ParsedSegment] = field(default_factory=list)
