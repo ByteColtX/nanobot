@@ -1982,22 +1982,24 @@ class NapCatWSChannel(BaseChannel):
 
         validation = validate_outbound_cq_text(content)
         if not validation.valid:
+            # 放宽：CQ 码校验失败也允许出站。
+            # 原因：不同 OneBot/NapCat 版本对 CQ 参数要求可能不同（例如 image.file 是否必须是 file:// URI）。
+            # 这里仅记录告警，避免因为本地校验过严导致消息被直接丢弃。
             detail = "; ".join(f"{x.code}:{x.message}" for x in validation.issues[:5])
             chat_type = str(msg.metadata.get("chat_type") or "")
             gid = msg.metadata.get("group_id") or msg.chat_id
             uid = msg.metadata.get("user_id") or msg.chat_id
             target = gid if chat_type == "group" else uid
             snippet = (content[:200] + "...") if len(content) > 200 else content
-            logger.error(
-                "napcat_ws drop outbound: invalid cq: {} chat_type={} target={} snippet={}",
+            logger.warning(
+                "napcat_ws outbound: invalid cq (allow anyway): {} chat_type={} target={} snippet={}",
                 detail,
                 chat_type,
                 target,
                 snippet,
             )
-            return
-
-        content = validation.normalized_text
+        else:
+            content = validation.normalized_text
 
         action = "send_group_msg" if msg.metadata.get("chat_type") == "group" else "send_private_msg"
 
