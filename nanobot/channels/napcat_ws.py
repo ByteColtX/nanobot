@@ -3066,6 +3066,7 @@ class NapCatWSChannel(BaseChannel):
         )
 
     def _allow_publish_to_agent(self, gate: PublishGateInput, *, kind: str) -> bool:
+        """防御性 publish gate。当前主要保留给 notice 链路使用。"""
         allowed, reason = _check_publish_gate(gate, config=self.config, channel_name=self.name)
         if allowed:
             return True
@@ -3135,14 +3136,6 @@ class NapCatWSChannel(BaseChannel):
         )
 
         if not decision.should_reply:
-            return
-
-        gate = PublishGateInput(
-            chat_type=msg.chat.chat_type,
-            actor_id=str(msg.sender_id),
-            group_id=str(msg.chat.group_id),
-        )
-        if not self._allow_publish_to_agent(gate, kind="message"):
             return
 
         bot_name = ""
