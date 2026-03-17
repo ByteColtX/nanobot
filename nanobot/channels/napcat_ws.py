@@ -902,187 +902,6 @@ class NapCatContextBuilderV2Impl:
             qq=qq, name=str(node.get("u") or qq or "unknown"), is_bot=bool(node.get("bot"))
         )
 
-    """进程内存缓存（最小可用版）。
-
-    目标：
-      - TTL 默认 1d
-      - 两个 namespace：reply / forward
-      - maxsize（条目数）限制：
-          reply=2048, forward=1024
-      - in-flight 去重：同一 key 并发只会触发一次 action
-
-    说明：
-      - 该缓存只用于“详情补全”阶段（reply/forward），
-        构建 <NAPCAT_WS_CONTEXT> 时禁止再发 action。
-      - 淘汰策略：近似 LRU（基于 OrderedDict）。
-    """
-
-    def __init__(
-        self,
-        *,
-        ttl_seconds: int = DEFAULT_CACHE_TTL_SECONDS,
-        reply_maxsize: int = V2_REPLY_CACHE_MAXSIZE,
-        forward_maxsize: int = V2_FORWARD_CACHE_MAXSIZE,
-    ) -> None:
-        self._ttl_s = float(ttl_seconds)
-
-        self._reply_max = int(reply_maxsize)
-        self._forward_max = int(forward_maxsize)
-
-        # LRU-ish: key -> {ts, v}
-        self._reply: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
-        self._forward: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
-
-        # in-flight futures
-        self._inflight_reply: dict[str, asyncio.Future[ExpandedReply]] = {}
-        self._inflight_forward: dict[str, asyncio.Future[ExpandedForward]] = {}
-
-    def _now(self) -> float:
-        return time.time()
-
-    def _is_expired(self, ts: float) -> bool:
-        return (self._now() - float(ts or 0.0)) > self._ttl_s
-
-    def _lru_get(
-        self, store: "OrderedDict[str, dict[str, Any]]", key: str
-    ) -> dict[str, Any] | None:
-        rec = store.get(key)
-        if not isinstance(rec, dict):
-            return None
-        ts = float(rec.get("ts") or 0.0)
-        if self._is_expired(ts):
-            try:
-                store.pop(key, None)
-            except Exception:
-                pass
-            return None
-        # touch
-        try:
-            store.move_to_end(key)
-        except Exception:
-            pass
-        return rec
-
-    def _lru_put(
-        self, store: "OrderedDict[str, dict[str, Any]]", key: str, rec: dict[str, Any], maxsize: int
-    ) -> None:
-        store[key] = rec
-        try:
-            store.move_to_end(key)
-        except Exception:
-            pass
-        # evict
-        if maxsize > 0:
-            while len(store) > maxsize:
-                try:
-                    store.popitem(last=False)
-                except Exception:
-                    break
-
-    def get_reply(self, message_id: str) -> Optional[ExpandedReply]:
-        mid = str(message_id or "").strip()
-        if not mid:
-            return None
-        rec = self._lru_get(self._reply, mid)
-        if not rec:
-            return None
-        v = rec.get("v")
-        return v if isinstance(v, ExpandedReply) else None
-
-    def put_reply(self, message_id: str, value: ExpandedReply) -> None:
-        mid = str(message_id or "").strip()
-        if not mid:
-            return
-        self._lru_put(self._reply, mid, {"ts": self._now(), "v": value}, self._reply_max)
-
-    def get_forward(self, forward_id: str) -> Optional[ExpandedForward]:
-        fid = str(forward_id or "").strip()
-        if not fid:
-            return None
-        rec = self._lru_get(self._forward, fid)
-        if not rec:
-            return None
-        v = rec.get("v")
-        return v if isinstance(v, ExpandedForward) else None
-
-    def put_forward(self, forward_id: str, value: ExpandedForward) -> None:
-        fid = str(forward_id or "").strip()
-        if not fid:
-            return
-        self._lru_put(self._forward, fid, {"ts": self._now(), "v": value}, self._forward_max)
-
-    async def get_or_fetch_reply(
-        self,
-        *,
-        message_id: str,
-        fetch: Callable[[], Awaitable[ExpandedReply]],
-    ) -> ExpandedReply:
-        """reply：cache miss 时触发一次 fetch，并对并发去重。"""
-
-        mid = str(message_id or "").strip()
-        if not mid:
-            return ExpandedReply(id="")
-
-        cached = self.get_reply(mid)
-        if cached is not None:
-            return cached
-
-        fut = self._inflight_reply.get(mid)
-        if fut is not None:
-            return await fut
-
-        loop = asyncio.get_running_loop()
-        fut = loop.create_future()
-        self._inflight_reply[mid] = fut
-        try:
-            v = await fetch()
-            if isinstance(v, ExpandedReply) and str(v.id or "").strip():
-                self.put_reply(mid, v)
-            fut.set_result(v)
-            return v
-        except Exception as exc:
-            if not fut.done():
-                fut.set_exception(exc)
-            raise
-        finally:
-            self._inflight_reply.pop(mid, None)
-
-    async def get_or_fetch_forward(
-        self,
-        *,
-        forward_id: str,
-        fetch: Callable[[], Awaitable[ExpandedForward]],
-    ) -> ExpandedForward:
-        """forward：cache miss 时触发一次 fetch，并对并发去重。"""
-
-        fid = str(forward_id or "").strip()
-        if not fid:
-            return ExpandedForward(id="")
-
-        cached = self.get_forward(fid)
-        if cached is not None:
-            return cached
-
-        fut = self._inflight_forward.get(fid)
-        if fut is not None:
-            return await fut
-
-        loop = asyncio.get_running_loop()
-        fut = loop.create_future()
-        self._inflight_forward[fid] = fut
-        try:
-            v = await fetch()
-            if isinstance(v, ExpandedForward) and str(v.id or "").strip():
-                self.put_forward(fid, v)
-            fut.set_result(v)
-            return v
-        except Exception as exc:
-            if not fut.done():
-                fut.set_exception(exc)
-            raise
-        finally:
-            self._inflight_forward.pop(fid, None)
-
 
 class NapCatMessageParserV2:
     """V2 解析器：只解析指定的 9 种 segment 类型，产出 CQ 风格 `m`。"""
@@ -1495,7 +1314,7 @@ class V2SessionStore:
 
 
 # ==============================
-# 2) Transport 层（WS + OneBot actions）
+# 2) Transport
 # ==============================
 
 
@@ -1986,6 +1805,11 @@ def _contains_any(text: str, keywords: list[str]) -> bool:
     return False
 
 
+# =========================================
+# 3) Policy
+# =========================================
+
+
 def _stable_random_0_1(seed: str) -> float:
     """稳定伪随机数（0~1）。
 
@@ -2166,6 +1990,10 @@ def decide_notice_trigger(
     return TriggerDecision(True, "poke", "poke")
 
 
+# =========================================
+# 4) Outbound validation helpers
+# =========================================
+
 _CQ_OUTBOUND_RE = re.compile(r"\[CQ:([^,\]]+)(?:,([^\]]+))?\]")
 
 
@@ -2281,7 +2109,7 @@ def validate_outbound_cq_text(content: str) -> CQValidationResult:
 
 
 # ==============================
-# 6) Channel glue（把各层串起来）
+# 5) Channel
 # ==============================
 
 
