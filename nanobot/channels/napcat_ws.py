@@ -214,7 +214,7 @@ ACTION_SEND_POKE = "send_poke"
 CACHE_TTL_1D_SECONDS = 60 * 60 * 24
 DEFAULT_CACHE_TTL_SECONDS = CACHE_TTL_1D_SECONDS
 
-# V2 cache 上限
+# message detail cache 上限
 V2_REPLY_CACHE_MAXSIZE = 2048
 V2_FORWARD_CACHE_MAXSIZE = 1024
 
@@ -306,7 +306,7 @@ class QuotedMessage:
     media: list[str] = field(default_factory=list)
     media_paths: list[str] = field(default_factory=list)
 
-    # V2：保留原始 message/raw_message，便于生成精简 CQ（避免把超长 raw_message 原样塞进上下文）
+    # 保留原始 message/raw_message，便于生成精简 CQ（避免把超长 raw_message 原样塞进上下文）
     message: Any = None
     raw_message: Any = None
 
@@ -376,9 +376,9 @@ class CQValidationResult:
 
 
 # =========================================
-# 1.1) Inbound V2 types
+# 1.1) Inbound context/message types
 # =========================================
-# 这里只放 V2 解析 / 展开 / 上下文构建需要的数据结构。
+# 这里只放消息解析 / 展开 / 上下文构建需要的数据结构。
 
 
 MessageSegmentType = Literal[
@@ -491,7 +491,7 @@ class ContextMessageLine:
 
 
 # =========================================
-# 1.1.1) Inbound V2 implementation（parser/cache/fetcher/context builder）
+# 1.1.1) Inbound implementation（parser/cache/fetcher/context builder）
 # =========================================
 #
 # 说明：
@@ -630,8 +630,8 @@ class _CQCtxBodyEncoder:
         return _cqctx_escape(f"[CQ:{typ}]")
 
 
-class NapCatContextBuilderV2Impl:
-    """V2 上下文构建器：输出紧凑的 CQCTX/3（群）或 CQDM/1（私聊）。"""
+class NapCatContextBuilder:
+    """上下文构建器：输出紧凑的 CQCTX/3（群）或 CQDM/1（私聊）。"""
 
     def build(
         self,
@@ -903,8 +903,8 @@ class NapCatContextBuilderV2Impl:
         )
 
 
-class NapCatMessageParserV2:
-    """V2 解析器：只解析指定的 9 种 segment 类型，产出 CQ 风格 `m`。"""
+class NapCatMessageParser:
+    """消息解析器：只解析指定的 9 种 segment 类型，产出 CQ 风格 `m`。"""
 
     # 解析 CQ 码的最小正则：匹配形如 [CQ:type,k=v,...]
     # 注意：这里不要写成 \\[CQ:...，否则会变成匹配字面量“\[CQ:”而不是“[CQ:”。
@@ -1106,10 +1106,10 @@ class NapCatMessageParserV2:
         return out
 
 
-class NapCatMessageDetailFetcherV2:
-    """V2 详情获取器：包装 NapCatTransport.call_action()."""
+class NapCatMessageDetailFetcher:
+    """消息详情获取器：包装 NapCatTransport.call_action()."""
 
-    def __init__(self, *, transport: "NapCatTransport", parser: NapCatMessageParserV2) -> None:
+    def __init__(self, *, transport: "NapCatTransport", parser: NapCatMessageParser) -> None:
         self._transport = transport
         self._parser = parser
 
@@ -1256,8 +1256,8 @@ class NapCatMessageDetailFetcherV2:
 
 
 @dataclass(slots=True)
-class V2SessionState:
-    """单个 session 的内存状态（V2）。
+class SessionBufferState:
+    """单个 session 的内存状态。
 
     - messages: 用于构建 <NAPCAT_WS_CONTEXT> 的 JSON-lines 消息窗口。
     - bot_message_ids: bot 已发送的 message_id（用于 reply_to_bot 触发兜底判断）。
@@ -1271,8 +1271,8 @@ class V2SessionState:
     bot_message_ids: Deque[str]
 
 
-class V2SessionStore:
-    """V2 Session store（进程内存）。
+class SessionBufferStore:
+    """Session buffer store（进程内存）。
 
     设计目标：
       - 单一事实来源：上下文与 reply_to_bot 判断都从这里取。
@@ -1281,11 +1281,11 @@ class V2SessionStore:
 
     def __init__(self, buffer_size: int) -> None:
         self._buffer_size = int(buffer_size or 50)
-        self._sessions: dict[str, V2SessionState] = {}
+        self._sessions: dict[str, SessionBufferState] = {}
 
-    def get_or_create(self, session_key: str) -> V2SessionState:
+    def get_or_create(self, session_key: str) -> SessionBufferState:
         if session_key not in self._sessions:
-            self._sessions[session_key] = V2SessionState(
+            self._sessions[session_key] = SessionBufferState(
                 messages=deque(maxlen=self._buffer_size),
                 bot_message_ids=deque(maxlen=max(self._buffer_size, 50)),
             )
@@ -1636,11 +1636,11 @@ def normalize_inbound(
     *,
     self_id: str,
     config: NapCatWSConfig,
-    parser_v2: NapCatMessageParserV2 | None = None,
+    message_parser: NapCatMessageParser | None = None,
 ) -> NormalizedInbound | None:
     """将 OneBot payload 归一化为内部消息结构。
 
-    Inbound 主链路只依赖 V2 parser：
+    Inbound 主链路只依赖消息解析器：
         - 仅处理 post_type == "message"
         - 统一在 normalize 阶段完成 plain/rendered/reply/forward/@/media 抽取
         - 不再混用 legacy message parser
@@ -1699,7 +1699,7 @@ def normalize_inbound(
     if message_field in (None, ""):
         message_field = payload.get("raw_message")
 
-    # 构造一个最小 payload 供 V2 parser 使用：
+    # 构造一个最小 payload 供消息解析器使用：
     # - message: 取 message/raw_message 的兜底
     # - raw_message/message_format: 原样透传
     payload_like = {
@@ -1707,24 +1707,26 @@ def normalize_inbound(
         "raw_message": payload.get("raw_message"),
         "message_format": payload.get("message_format"),
     }
-    parsed_v2 = (
-        parser_v2.parse(payload=payload_like, self_id=str(self_id or ""))
-        if parser_v2
+    parsed_message = (
+        message_parser.parse(payload=payload_like, self_id=str(self_id or ""))
+        if message_parser
         else ParsedMessage()
     )
 
-    text = str(parsed_v2.plain_text or "").strip()
-    rendered_text = str(parsed_v2.rendered_text or parsed_v2.cq_text or text or "").strip()
-    rendered_segments = list(parsed_v2.rendered_segments or [])
+    text = str(parsed_message.plain_text or "").strip()
+    rendered_text = str(
+        parsed_message.rendered_text or parsed_message.cq_text or text or ""
+    ).strip()
+    rendered_segments = list(parsed_message.rendered_segments or [])
 
-    reply_message_id = str(parsed_v2.reply_id or "")
+    reply_message_id = str(parsed_message.reply_id or "")
     reply: QuotedMessage | None = None
     if reply_message_id:
         reply = QuotedMessage(message_id=reply_message_id)
 
     sid = str(self_id or "").strip()
-    at_self = bool(sid and sid in [str(x).strip() for x in parsed_v2.at_qq])
-    forward_id = str(parsed_v2.forward_id or "")
+    at_self = bool(sid and sid in [str(x).strip() for x in parsed_message.at_qq])
+    forward_id = str(parsed_message.forward_id or "")
 
     return NormalizedInbound(
         chat=ChatRef(
@@ -1740,7 +1742,7 @@ def normalize_inbound(
         text=text,
         rendered_text=rendered_text,
         rendered_segments=rendered_segments,
-        media=list(parsed_v2.media or []),
+        media=list(parsed_message.media or []),
         at_self=at_self,
         reply=reply,
         forward_id=forward_id,
@@ -1852,7 +1854,7 @@ def _is_allowed_source(msg: NormalizedInbound, config: NapCatWSConfig) -> bool:
 
 
 def _is_reply_to_bot(
-    msg: NormalizedInbound, *, store: V2SessionStore, session_key: str, self_id: str
+    msg: NormalizedInbound, *, store: SessionBufferStore, session_key: str, self_id: str
 ) -> bool:
     """判断 msg.reply 是否是在回复 bot。"""
 
@@ -1925,7 +1927,7 @@ def _check_message_direct_trigger(
     msg: NormalizedInbound,
     *,
     config: NapCatWSConfig,
-    store: V2SessionStore,
+    store: SessionBufferStore,
     session_key: str,
     self_id: str,
 ) -> TriggerDecision | None:
@@ -1978,7 +1980,7 @@ def decide_message_trigger(
     msg: NormalizedInbound,
     *,
     config: NapCatWSConfig,
-    store: V2SessionStore,
+    store: SessionBufferStore,
     session_key: str,
     self_id: str,
 ) -> TriggerDecision:
@@ -2213,19 +2215,19 @@ class NapCatWSChannel(BaseChannel):
         self._media_dir = get_media_dir() / "napcat_ws"
         self._media_dir.mkdir(parents=True, exist_ok=True)
 
-        self._store = V2SessionStore(buffer_size=self.config.session_buffer_size)
+        self._store = SessionBufferStore(buffer_size=self.config.session_buffer_size)
         self._transport = NapCatTransport(config=self.config, on_event=self._on_transport_event)
 
-        self._parser_v2 = NapCatMessageParserV2()
-        self._cache_v2 = InMemoryMessageCache(
+        self._message_parser = NapCatMessageParser()
+        self._message_cache = InMemoryMessageCache(
             ttl_seconds=DEFAULT_CACHE_TTL_SECONDS,
             reply_maxsize=V2_REPLY_CACHE_MAXSIZE,
             forward_maxsize=V2_FORWARD_CACHE_MAXSIZE,
         )
-        self._fetcher_v2 = NapCatMessageDetailFetcherV2(
-            transport=self._transport, parser=self._parser_v2
+        self._detail_fetcher = NapCatMessageDetailFetcher(
+            transport=self._transport, parser=self._message_parser
         )
-        self._ctx_builder_v2 = NapCatContextBuilderV2Impl()
+        self._context_builder = NapCatContextBuilder()
 
         # 多次回复（multi-turn follow-up）任务容器：保留该能力，具体调度逻辑后续实现。
         self._followup_tasks: dict[str, asyncio.Task[None]] = {}
@@ -2609,10 +2611,10 @@ class NapCatWSChannel(BaseChannel):
         当前主链路仅把 poke(notify/poke) 视为可触发事件。
 
         设计目标：notice 也要进入与 message 同样的主链路：
-          Normalize(轻量) -> Policy -> Session/Context(V2 store) -> Agent(bus) -> Outbound(send)
+          Normalize(轻量) -> Policy -> Session/Context(session buffer) -> Agent(bus) -> Outbound(send)
 
         注意：notice 没有天然的 message_id/message 段，因此这里会生成一个稳定的“事件 id”，并用
-        一条 ContextMessageLine 记录到 V2 store 中。
+        一条 ContextMessageLine 记录到 session buffer 中。
         """
 
         decision = decide_notice_trigger(
@@ -2671,7 +2673,7 @@ class NapCatWSChannel(BaseChannel):
             ts_i = int(time.time())
         event_id = f"notice:{notice_type}:{sub_type}:{ts_i}:{actor}:{group_id or 'private'}"
 
-        # 入库一条 V2 context line：让 poke 成为“可见上下文事件”
+        # 入库一条 context line：让 poke 成为“可见上下文事件”
         poke_text = "(poke)"
         self._store.append_message(
             session_key,
@@ -2712,7 +2714,7 @@ class NapCatWSChannel(BaseChannel):
             rendered_text=poke_text,
             raw_event=dict(payload),
         )
-        content = self._build_chat_context_v2(
+        content = self._build_chat_context(
             msg=msg,
             session_key=session_key,
             bot_name=bot_name,
@@ -2798,17 +2800,11 @@ class NapCatWSChannel(BaseChannel):
     # ------------------------------
 
     # ------------------------------
-    # V2: JSON lines 上下文（立刻启用）
+    # JSON lines 上下文（立刻启用）
     # ------------------------------
 
-    async def _v2_build_line(self, msg: NormalizedInbound) -> ContextMessageLine:
-        """把当前归一化消息投影成 V2 的 ContextMessageLine（含可选 r/f）。
-
-        规则：
-          - `m`：严格使用 parser_v2 的 CQ 风格输出（或 raw_message 兜底）
-          - `r`：reply 展开（方案 A）：{"u","m"}
-          - `f`：forward 展开：[{"u","m"}, ...]
-        """
+    async def _build_context_line(self, msg: NormalizedInbound) -> ContextMessageLine:
+        """把当前归一化消息投影成上下文行；只做 projection/render，不做详情补全。"""
 
         message_field = msg.raw_event.get("message")
         raw_field = msg.raw_event.get("raw_message")
@@ -2829,142 +2825,87 @@ class NapCatWSChannel(BaseChannel):
             "raw_message": raw_field,
             "message_format": message_format,
         }
-        parsed = self._parser_v2.parse(payload=payload_like, self_id=str(self._self_id or ""))
-        m_raw = (
+        parsed = self._message_parser.parse(payload=payload_like, self_id=str(self._self_id or ""))
+        rendered_text = (
             parsed.cq_text
             or str(msg.raw_event.get("raw_message") or msg.rendered_text or msg.text or "").strip()
         )
-        m = self._truncate_user_text(m_raw)
 
         line = ContextMessageLine(
             u=str(msg.sender_name or msg.sender_id or "unknown"),
             q=str(msg.sender_id or ""),
             id=str(msg.message_id or ""),
-            m=m,
+            m=self._truncate_user_text(rendered_text),
             chat_type=msg.chat.chat_type,
             group_id=str(msg.chat.group_id or ""),
             is_bot=(str(msg.sender_id or "") == str(self._self_id or "")),
         )
 
-        # reply 展开：优先复用现有 msg.reply（已 expand_quote），否则走 cache+fetcher
-        rid = str(parsed.reply_id or "").strip()
-        if not rid and msg.reply is not None and msg.reply.message_id:
-            rid = str(msg.reply.message_id).strip()
-
-        if rid:
-            # 优先复用 msg.reply，并统一用 parser_v2 生成精简 CQ
-            if msg.reply is not None and str(msg.reply.message_id or "").strip() == rid:
-                payload_like_quote = {
-                    "message": msg.reply.message,
-                    "raw_message": msg.reply.raw_message,
-                    "message_format": "array" if isinstance(msg.reply.message, list) else "string",
-                }
-                pq = self._parser_v2.parse(
-                    payload=payload_like_quote, self_id=str(self._self_id or "")
-                )
-                qm_raw = str(pq.cq_text or "").strip() or str(msg.reply.text or "").strip()
-                qm = self._truncate_user_text(qm_raw)
-                qu = str(msg.reply.sender_name or msg.reply.sender_id or "unknown")
-                if qu and qm:
-                    line.r = {
-                        "u": qu,
-                        "q": str(msg.reply.sender_id or ""),
-                        "m": qm,
-                        "id": str(msg.reply.message_id or rid),
-                        "bot": (str(msg.reply.sender_id or "") == str(self._self_id or "")),
-                    }
-            else:
-                try:
-                    exp = await self._cache_v2.get_or_fetch_reply(
-                        message_id=rid,
-                        fetch=lambda: self._fetcher_v2.expand_reply(message_id=rid, chat=msg.chat),
-                    )
-                except Exception:
-                    exp = None
-
-                if exp is not None and str(exp.u or "").strip() and str(exp.m or "").strip():
-                    line.r = {
-                        "u": str(exp.u),
-                        "q": str(exp.q or ""),
-                        "m": self._truncate_user_text(str(exp.m)),
-                        "id": rid,
-                        "bot": (str(exp.q or "") == str(self._self_id or "")),
-                    }
-
-        # forward 展开：优先复用现有 msg.forward_items（已 expand_forward），否则走 cache+fetcher
-        fid = str(parsed.forward_id or "").strip()
-        if not fid and msg.forward_id:
-            fid = str(msg.forward_id).strip()
-
-        if fid:
-            # 如果 normalize/expand 已经拿到 forward_items，我们优先把它们转成 V2 的 {u,m}，避免重复 action
-            if msg.forward_items:
-                items_v2: list[dict[str, Any]] = []
-                for it in msg.forward_items:
-                    if not isinstance(it, dict):
-                        continue
-                    u2 = str(it.get("sender_name") or it.get("sender_id") or "unknown")
-                    q2 = str(it.get("sender_id") or "").strip()
-
-                    payload_like_node = {
-                        "message": it.get("message"),
-                        "raw_message": it.get("raw_message"),
-                        "message_format": "array"
-                        if isinstance(it.get("message"), list)
-                        else "string",
-                    }
-                    parsed_node = self._parser_v2.parse(
-                        payload=payload_like_node, self_id=str(self._self_id or "")
-                    )
-                    t2 = str(parsed_node.cq_text or "").strip()
-                    if not t2:
-                        t2 = str(it.get("text") or "").strip()
-
-                    t2 = self._truncate_user_text(t2)
-
-                    if t2:
-                        items_v2.append(
-                            {
-                                "u": u2,
-                                "q": q2,
-                                "id": str(it.get("message_id") or "").strip(),
-                                "m": t2,
-                                "src": str(it.get("src") or "").strip(),
-                                "media_paths": list(it.get("media_paths") or []),
-                            }
-                        )
-
-                fexp = ExpandedForward(
-                    id=fid, items=items_v2, summary=str(msg.forward_summary or "")
-                )
-                # 写入 cache，避免后续重复
-                try:
-                    self._cache_v2.put_forward(fid, fexp)
-                except Exception:
-                    pass
-            else:
-                try:
-                    fexp = await self._cache_v2.get_or_fetch_forward(
-                        forward_id=fid,
-                        fetch=lambda: self._fetcher_v2.expand_forward(
-                            forward_id=fid, chat=msg.chat
-                        ),
-                    )
-                except Exception:
-                    fexp = None
-
-            if fexp is not None and getattr(fexp, "items", None):
-                line.f = list(fexp.items)
-
+        line.r = self._build_context_reply_line(msg.reply)
+        line.f = self._build_context_forward_lines(msg.forward_items)
         return line
 
-    def _build_chat_context_v2(
+    def _build_context_reply_line(self, reply: QuotedMessage | None) -> dict[str, Any] | None:
+        """把已 enrich 的 reply 投影成上下文里的 `r` 字段。"""
+
+        if reply is None or not str(reply.message_id or "").strip():
+            return None
+
+        rendered_text = self._render_context_message_text(
+            message=reply.message, raw=reply.raw_message
+        )
+        if not rendered_text:
+            rendered_text = str(reply.text or "").strip()
+        rendered_text = self._truncate_user_text(rendered_text)
+        sender_name = str(reply.sender_name or reply.sender_id or "unknown")
+        if not sender_name or not rendered_text:
+            return None
+
+        return {
+            "u": sender_name,
+            "q": str(reply.sender_id or ""),
+            "m": rendered_text,
+            "id": str(reply.message_id or "").strip(),
+            "bot": (str(reply.sender_id or "") == str(self._self_id or "")),
+        }
+
+    def _build_context_forward_lines(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """把已 enrich 的 forward_items 投影成上下文里的 `f` 字段。"""
+
+        rendered_items: list[dict[str, Any]] = []
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+
+            rendered_text = self._render_context_message_text(
+                message=item.get("message"),
+                raw=item.get("raw_message"),
+            )
+            if not rendered_text:
+                rendered_text = str(item.get("text") or "").strip()
+            rendered_text = self._truncate_user_text(rendered_text)
+            if not rendered_text:
+                continue
+
+            rendered_items.append(
+                {
+                    "u": str(item.get("sender_name") or item.get("sender_id") or "unknown"),
+                    "q": str(item.get("sender_id") or "").strip(),
+                    "id": str(item.get("message_id") or "").strip(),
+                    "m": rendered_text,
+                    "src": str(item.get("src") or "").strip(),
+                    "media_paths": list(item.get("media_paths") or []),
+                }
+            )
+        return rendered_items
+
+    def _build_chat_context(
         self, *, msg: NormalizedInbound, session_key: str, bot_name: str
     ) -> str:
         hist_limit = int(getattr(self.config, "context_max_messages", 20) or 20)
         hist = self._store.recent_messages(session_key, hist_limit)
 
-        return self._ctx_builder_v2.build(
+        return self._context_builder.build(
             chat=msg.chat,
             bot_name=str(bot_name or ""),
             bot_id=str(self._self_id or ""),
@@ -2993,18 +2934,18 @@ class NapCatWSChannel(BaseChannel):
             pass
 
     async def _cache_message_line(self, *, msg: NormalizedInbound, session_key: str) -> None:
-        # V2: 始终缓存一条 JSON line（用于构建 <NAPCAT_WS_CONTEXT>）
+        # 始终缓存一条 JSON line（用于构建 <NAPCAT_WS_CONTEXT>）
         try:
-            v2_line = await self._v2_build_line(msg)
-            # 关键修复：把“这条消息可见的图片”也存进 v2_line（但不写入上下文文本）。
+            context_line = await self._build_context_line(msg)
+            # 关键修复：把“这条消息可见的图片”也存进 context_line（但不写入上下文文本）。
             # 这样后续触发时可以把历史图片合并进 InboundMessage.media。
             try:
-                v2_line.media_paths = list(msg.media_paths or [])
+                context_line.media_paths = list(msg.media_paths or [])
             except Exception:
                 pass
-            self._store.append_message(session_key, v2_line)
+            self._store.append_message(session_key, context_line)
         except Exception as exc:
-            logger.debug("napcat_ws v2 build line failed: {}", exc)
+            logger.debug("napcat_ws build context line failed: {}", exc)
 
     def _collect_visible_media(self, *, msg: NormalizedInbound, session_key: str) -> list[str]:
         # 关键修复：历史/引用/合并转发图片的可见性。
@@ -3072,7 +3013,7 @@ class NapCatWSChannel(BaseChannel):
             payload,
             self_id=str(self._self_id or ""),
             config=self.config,
-            parser_v2=self._parser_v2,
+            message_parser=self._message_parser,
         )
         if msg is None:
             self._log_ignored(payload)
@@ -3121,7 +3062,7 @@ class NapCatWSChannel(BaseChannel):
         except Exception:
             bot_name = ""
 
-        content = self._build_chat_context_v2(
+        content = self._build_chat_context(
             msg=msg,
             session_key=session_key,
             bot_name=bot_name,
@@ -3151,9 +3092,9 @@ class NapCatWSChannel(BaseChannel):
             return
 
         try:
-            exp = await self._cache_v2.get_or_fetch_reply(
+            exp = await self._message_cache.get_or_fetch_reply(
                 message_id=rid,
-                fetch=lambda: self._fetcher_v2.expand_reply(message_id=rid, chat=msg.chat),
+                fetch=lambda: self._detail_fetcher.expand_reply(message_id=rid, chat=msg.chat),
             )
         except Exception as exc:
             logger.debug("napcat_ws quote expand failed: {}", exc)
@@ -3215,9 +3156,9 @@ class NapCatWSChannel(BaseChannel):
             return []
 
         try:
-            fexp = await self._cache_v2.get_or_fetch_forward(
+            fexp = await self._message_cache.get_or_fetch_forward(
                 forward_id=fid,
-                fetch=lambda: self._fetcher_v2.expand_forward(forward_id=fid, chat=chat),
+                fetch=lambda: self._detail_fetcher.expand_forward(forward_id=fid, chat=chat),
             )
         except Exception as exc:
             logger.debug("napcat_ws forward fetch failed: {}", exc)
@@ -3227,7 +3168,7 @@ class NapCatWSChannel(BaseChannel):
             return []
 
         # 关键修复：合并转发节点里的图片也要下载到本地，让大模型可见。
-        # NapCat get_forward_msg 返回的节点消息在 expand_forward 中已被 parser_v2 解析，
+        # NapCat get_forward_msg 返回的节点消息在 expand_forward 中已被 消息解析器解析，
         # 这里复用其 media_meta（只包含 https 图片 url + file/name）。
         forward_media_meta = list(getattr(fexp, "media_meta", None) or [])
         if forward_media_meta:
@@ -3307,7 +3248,13 @@ class NapCatWSChannel(BaseChannel):
             "raw_message": raw,
             "message_format": message_format,
         }
-        return self._parser_v2.parse(payload=payload_like, self_id=str(self._self_id or ""))
+        return self._message_parser.parse(payload=payload_like, self_id=str(self._self_id or ""))
+
+    def _render_context_message_text(self, *, message: Any, raw: Any = None) -> str:
+        """把消息体渲染成上下文用的精简文本。"""
+
+        parsed = self._parse_payload_message(message=message, raw=raw)
+        return str(parsed.cq_text or "").strip()
 
     def _render_text_and_media(
         self, *, message: Any, raw: Any
