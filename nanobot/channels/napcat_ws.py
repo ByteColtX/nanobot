@@ -2797,30 +2797,14 @@ class NapCatWSChannel(BaseChannel):
     async def _build_context_line(self, msg: NormalizedInbound) -> ContextMessageLine:
         """把当前归一化消息投影成上下文行；只做 projection/render，不做详情补全。"""
 
-        message_field = msg.raw_event.get("message")
-        raw_field = msg.raw_event.get("raw_message")
-        if message_field in (None, ""):
-            message_field = raw_field
-
-        message_format = msg.raw_event.get("message_format")
-        if message_format in (None, ""):
-            if isinstance(message_field, list):
-                message_format = "array"
-            elif isinstance(message_field, str):
-                message_format = "string"
-            else:
-                message_format = None
-
-        payload_like = {
-            "message": message_field,
-            "raw_message": raw_field,
-            "message_format": message_format,
-        }
-        parsed = self._message_parser.parse(payload=payload_like, self_id=str(self._self_id or ""))
-        rendered_text = (
-            parsed.cq_text
-            or str(msg.raw_event.get("raw_message") or msg.rendered_text or msg.text or "").strip()
+        rendered_text = self._render_context_message_text(
+            message=msg.raw_event.get("message"),
+            raw=msg.raw_event.get("raw_message"),
         )
+        if not rendered_text:
+            rendered_text = str(
+                msg.raw_event.get("raw_message") or msg.rendered_text or msg.text or ""
+            ).strip()
 
         line = ContextMessageLine(
             u=str(msg.sender_name or msg.sender_id or "unknown"),
