@@ -1822,8 +1822,14 @@ def _stable_random_0_1(seed: str) -> float:
     return (n % 1_000_000) / 1_000_000.0
 
 
-def _is_allowed_source(msg: NormalizedInbound, config: NapCatWSConfig) -> bool:
-    """allow_from 白名单判断。
+def _is_allowed_chat_source(
+    *,
+    chat_type: ChatType,
+    chat_id: str,
+    sender_id: str,
+    config: NapCatWSConfig,
+) -> bool:
+    """allow_from 白名单判断的底层实现。
 
     仅支持三种语义：
       - "*"：全部允许
@@ -1831,22 +1837,34 @@ def _is_allowed_source(msg: NormalizedInbound, config: NapCatWSConfig) -> bool:
       - "<QQ号>"：允许对应私聊 / 对应发送者
     """
 
-    allow = list(getattr(config, "allow_from", []) or [])
+    allow = [str(x).strip() for x in (getattr(config, "allow_from", []) or []) if str(x).strip()]
     if not allow:
         # schema 默认是 ["*"]，这里保持“空=不额外限制”的宽松策略
         return True
-
-    allow = [str(x).strip() for x in allow if str(x).strip()]
     if "*" in allow:
         return True
 
+    if chat_type == "group":
+        return bool(chat_id and chat_id in allow)
+    return bool((chat_id and chat_id in allow) or (sender_id and sender_id in allow))
+
+
+def _is_allowed_source(msg: NormalizedInbound, config: NapCatWSConfig) -> bool:
+    """allow_from 白名单判断（message 版本）。"""
+
     sender_id = str(msg.sender_id or "").strip()
     if msg.chat.chat_type == "group":
-        gid = str(msg.chat.group_id or msg.chat.chat_id or "").strip()
-        return bool(gid and gid in allow)
+        chat_id = str(msg.chat.group_id or msg.chat.chat_id or "").strip()
+    else:
+        chat_id = str(msg.chat.user_id or msg.chat.chat_id or sender_id or "").strip()
 
-    uid = str(msg.chat.user_id or msg.chat.chat_id or sender_id or "").strip()
-    return bool((uid and uid in allow) or (sender_id and sender_id in allow))
+    return _is_allowed_chat_source(
+        chat_type=msg.chat.chat_type,
+        chat_id=chat_id,
+        sender_id=sender_id,
+        config=config,
+    )
+
 
 
 def _is_reply_to_bot(
@@ -2013,20 +2031,17 @@ def decide_message_trigger(
 def _is_allowed_notice_source(
     *, actor_id: str, group_id: str, config: NapCatWSConfig
 ) -> bool:
-    """allow_from 白名单判断（notice 版本）。
+    """allow_from 白名单判断（notice 版本）。"""
 
-    仅支持三种语义：
-      - "*"：全部允许
-      - "<群号>"：允许对应群聊 notice
-      - "<QQ号>"：允许对应私聊 / 对应发起者
-    """
-
-    allow = [str(x).strip() for x in (getattr(config, "allow_from", []) or []) if str(x).strip()]
-    if not allow or "*" in allow:
-        return True
-    if group_id:
-        return group_id in allow
-    return bool(actor_id and actor_id in allow)
+    chat_type: ChatType = "group" if group_id else "private"
+    chat_id = str(group_id or actor_id or "").strip()
+    sender_id = str(actor_id or "").strip()
+    return _is_allowed_chat_source(
+        chat_type=chat_type,
+        chat_id=chat_id,
+        sender_id=sender_id,
+        config=config,
+    )
 
 
 
