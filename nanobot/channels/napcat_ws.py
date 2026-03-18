@@ -1455,6 +1455,45 @@ class NapCatMessageDetailFetcher:
         gid = str(group_id or "").strip()
         return f"g:{gid}" if gid else ""
 
+    @staticmethod
+    def _build_enriched_forward_item(
+        item: ForwardItemRecord,
+        *,
+        media_paths: list[str],
+    ) -> dict[str, Any]:
+        """把 forward 节点记录转换为当前入站链路使用的结构。"""
+
+        return {
+            "sender_id": str(item.sender_id or ""),
+            "sender_name": str(item.sender_name or item.sender_id or "unknown"),
+            "message_id": str(item.message_id or "").strip(),
+            "time": None,
+            "text": str(item.text or ""),
+            "media": [],
+            "media_paths": list(media_paths),
+            "media_meta": list(item.media_meta or []),
+            "message": None,
+            "raw_message": None,
+            "src": str(item.source or "").strip(),
+        }
+
+    @staticmethod
+    def _build_fake_image_message(media_meta: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """把图片 media_meta 转成最小 image segments，供统一下载器复用。"""
+
+        fake_message: list[dict[str, Any]] = []
+        for media in media_meta:
+            if not isinstance(media, dict):
+                continue
+            if str(media.get("type") or "") != "image":
+                continue
+            url = str(media.get("url") or "").strip()
+            name = str(media.get("file") or media.get("safe_name") or "").strip()
+            if not url or not name:
+                continue
+            fake_message.append({"type": "image", "data": {"url": url, "file": name}})
+        return fake_message
+
     async def expand_reply(self, *, message_id: str, chat: ChatRef) -> ExpandedReply:
         """展开引用消息（reply）。
 
@@ -3681,18 +3720,9 @@ class NapCatWSChannel(BaseChannel):
             if isinstance(getattr(exp, "message", None), list):
                 paths = await self._download_images_from_message(getattr(exp, "message"))
             else:
-                meta = list(getattr(exp, "media_meta", None) or [])
-                fake_message: list[dict[str, Any]] = []
-                for m in meta:
-                    if not isinstance(m, dict):
-                        continue
-                    if str(m.get("type") or "") != "image":
-                        continue
-                    url = str(m.get("url") or "").strip()
-                    name = str(m.get("file") or m.get("safe_name") or "").strip()
-                    if not url or not name:
-                        continue
-                    fake_message.append({"type": "image", "data": {"url": url, "file": name}})
+                fake_message = self._build_fake_image_message(
+                    list(getattr(exp, "media_meta", None) or [])
+                )
                 if fake_message:
                     paths = await self._download_images_from_message(fake_message)
             msg.reply.media_paths = paths
@@ -3700,19 +3730,7 @@ class NapCatWSChannel(BaseChannel):
             msg.reply.media_paths = []
 
         msg.reply.forward_items = [
-            {
-                "sender_id": str(item.sender_id or ""),
-                "sender_name": str(item.sender_name or item.sender_id or "unknown"),
-                "message_id": str(item.message_id or "").strip(),
-                "time": None,
-                "text": str(item.text or ""),
-                "media": [],
-                "media_paths": [],
-                "media_meta": list(item.media_meta or []),
-                "message": None,
-                "raw_message": None,
-                "src": str(item.source or "").strip(),
-            }
+            self._build_enriched_forward_item(item, media_paths=[])
             for item in list(getattr(getattr(exp, "forward", None), "items", None) or [])
         ]
         msg.reply.forward_id = str(getattr(exp, "id", "") or rid)
@@ -3763,19 +3781,7 @@ class NapCatWSChannel(BaseChannel):
         forward_media_meta = list(getattr(fexp, "media_meta", None) or [])
         if forward_media_meta:
             try:
-                # 直接走与普通消息同一套下载器：构造最小 segments 供 _extract_https_image_items 识别。
-                fake_message: list[dict[str, Any]] = []
-                for m in forward_media_meta:
-                    if not isinstance(m, dict):
-                        continue
-                    if str(m.get("type") or "") != "image":
-                        continue
-                    url = str(m.get("url") or "").strip()
-                    name = str(m.get("file") or "").strip()
-                    if not url or not name:
-                        continue
-                    fake_message.append({"type": "image", "data": {"url": url, "file": name}})
-
+                fake_message = self._build_fake_image_message(forward_media_meta)
                 forward_paths = await self._download_images_from_message(fake_message)
             except Exception as exc:
                 logger.debug("napcat_ws forward_image_download_failed err={}", exc)
@@ -3783,24 +3789,10 @@ class NapCatWSChannel(BaseChannel):
         else:
             forward_paths = []
 
-        items: list[dict[str, Any]] = []
-        for item in fexp.items:
-            items.append(
-                {
-                    "sender_id": str(item.sender_id or ""),
-                    "sender_name": str(item.sender_name or item.sender_id or "unknown"),
-                    "message_id": str(item.message_id or "").strip(),
-                    "time": None,
-                    "text": str(item.text or ""),
-                    "media": [],
-                    "media_paths": list(forward_paths),
-                    "media_meta": list(item.media_meta or []),
-                    "message": None,
-                    "raw_message": None,
-                    "src": str(item.source or "").strip(),
-                }
-            )
-        return items
+        return [
+            self._build_enriched_forward_item(item, media_paths=forward_paths)
+            for item in fexp.items
+        ]
 
     async def _expand_forward(self, msg: NormalizedInbound) -> None:
         """展开当前消息中的合并转发（forward）。
