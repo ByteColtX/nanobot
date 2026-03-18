@@ -3408,6 +3408,15 @@ class NapCatWSChannel(BaseChannel):
                 pass
 
     async def _fetch_forward_items(self, forward_id: str, chat: ChatRef) -> list[dict[str, Any]]:
+        """拉取并展开 forward items。
+
+        Args:
+            forward_id: forward id。
+            chat: 聊天信息（用于 expand_forward 内部的私聊 src 补充）。
+
+        Returns:
+            标准化后的 forward item 字典列表。
+        """
         fid = str(forward_id or "").strip()
         if not fid:
             return []
@@ -3472,6 +3481,11 @@ class NapCatWSChannel(BaseChannel):
         return items
 
     async def _expand_forward(self, msg: NormalizedInbound) -> None:
+        """展开当前消息中的合并转发（forward）。
+
+        Args:
+            msg: 入站消息（原地写入 `forward_items/forward_summary`）。
+        """
         if not msg.forward_id:
             return
 
@@ -3494,6 +3508,15 @@ class NapCatWSChannel(BaseChannel):
         return fallback or "unknown"
 
     def _parse_payload_message(self, *, message: Any, raw: Any = None) -> ParsedMessage:
+        """把 message/raw_message 解析为 `ParsedMessage`。
+
+        Args:
+            message: payload 的 message 字段（可能是 list/str/None）。
+            raw: payload 的 raw_message 兜底值。
+
+        Returns:
+            解析结果。
+        """
         payload_msg = message if message not in (None, "") else raw
         message_format = (
             "array"
@@ -3516,6 +3539,18 @@ class NapCatWSChannel(BaseChannel):
     def _render_text_and_media(
         self, *, message: Any, raw: Any
     ) -> tuple[str, list[str], list[dict[str, Any]]]:
+        """渲染消息文本并提取媒体信息。
+
+        Args:
+            message: message 字段（segments 或 CQ 字符串）。
+            raw: raw_message 兜底。
+
+        Returns:
+            三元组 `(effective_text, media, media_meta)`：
+            - effective_text: 适合进入上下文的渲染文本
+            - media: 媒体 URL 列表（通常为图片）
+            - media_meta: 媒体元信息（用于后续下载/回填）
+        """
         parsed = self._parse_payload_message(message=message, raw=raw)
         effective_text = str(
             parsed.rendered_text or parsed.cq_text or parsed.plain_text or ""
