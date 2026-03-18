@@ -1894,6 +1894,46 @@ def _resolve_at_self(parsed_message: ParsedMessage, *, self_id: str) -> bool:
     return bool(sid and sid in [str(value).strip() for value in parsed_message.at_qq])
 
 
+def _render_inbound_text(parsed_message: ParsedMessage) -> tuple[str, str]:
+    """从解析结果提取 plain/rendered 文本。"""
+
+    text = str(parsed_message.plain_text or "").strip()
+    rendered_text = str(
+        parsed_message.rendered_text or parsed_message.cq_text or text or ""
+    ).strip()
+    return text, rendered_text
+
+
+def _build_normalized_inbound(
+    *,
+    payload: dict[str, Any],
+    chat: ChatRef,
+    sender_name: str,
+    message_id: str,
+    timestamp: datetime,
+    parsed_message: ParsedMessage,
+    self_id: str,
+) -> NormalizedInbound:
+    """根据解析结果组装标准化入站消息。"""
+
+    text, rendered_text = _render_inbound_text(parsed_message)
+    return NormalizedInbound(
+        chat=chat,
+        sender_id=chat.user_id,
+        sender_name=sender_name,
+        message_id=message_id,
+        timestamp=timestamp,
+        text=text,
+        rendered_text=rendered_text,
+        rendered_segments=list(parsed_message.rendered_segments or []),
+        media=list(parsed_message.media or []),
+        at_self=_resolve_at_self(parsed_message, self_id=self_id),
+        reply=_build_inbound_reply(parsed_message),
+        forward_id=str(parsed_message.forward_id or ""),
+        raw_event=payload,
+    )
+
+
 def normalize_inbound(
     payload: dict[str, Any],
     *,
@@ -1936,25 +1976,14 @@ def normalize_inbound(
         else ParsedMessage()
     )
 
-    text = str(parsed_message.plain_text or "").strip()
-    rendered_text = str(
-        parsed_message.rendered_text or parsed_message.cq_text or text or ""
-    ).strip()
-
-    return NormalizedInbound(
+    return _build_normalized_inbound(
+        payload=payload,
         chat=chat,
-        sender_id=chat.user_id,
         sender_name=sender_name,
         message_id=message_id,
         timestamp=timestamp,
-        text=text,
-        rendered_text=rendered_text,
-        rendered_segments=list(parsed_message.rendered_segments or []),
-        media=list(parsed_message.media or []),
-        at_self=_resolve_at_self(parsed_message, self_id=self_id),
-        reply=_build_inbound_reply(parsed_message),
-        forward_id=str(parsed_message.forward_id or ""),
-        raw_event=payload,
+        parsed_message=parsed_message,
+        self_id=self_id,
     )
 
 
