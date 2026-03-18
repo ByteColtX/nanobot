@@ -847,6 +847,18 @@ class NapCatContextBuilder:
         return symbols
 
     def _collect_line_assets(self, *, line: ContextMessageLine, symbols: _CQCtxSymbolTable) -> None:
+        """从单条上下文消息行收集需要写入符号表的实体。
+
+        目前会收集：
+        - 行内图片（CQ image token）
+        - reply 引用块中的图片
+        - media_paths（本地已下载媒体）
+        - forward 节点中的用户与图片
+
+        Args:
+            line: 上下文消息行。
+            symbols: CQCtx 符号表。
+        """
         self._collect_images_from_text(line.m, symbols)
         if isinstance(line.r, dict):
             qq = str(line.r.get("q") or "").strip()
@@ -872,6 +884,12 @@ class NapCatContextBuilder:
                     symbols.image_ref(fn)
 
     def _collect_images_from_text(self, text: str, symbols: _CQCtxSymbolTable) -> None:
+        """扫描文本中的 image token，并把图片文件名记录到符号表。
+
+        Args:
+            text: 可能包含 CQ token 的文本。
+            symbols: CQCtx 符号表。
+        """
         for m in _CQCtxBodyEncoder._token_re.finditer(str(text or "")):
             typ = str(m.group(1) or "").strip().lower()
             if typ != "image":
@@ -896,6 +914,20 @@ class NapCatContextBuilder:
         bot_name: str,
         chat: ChatRef,
     ) -> list[str]:
+        """把上下文消息行序列化为 CQCTX/CQDM 的行列表。
+
+        Args:
+            messages: 上下文消息行。
+            symbols: CQCtx 符号表。
+            encoder: CQCtx body 编码器。
+            private_mode: 是否为私聊模式（决定 sender ref 的规则）。
+            bot_id: 机器人 ID。
+            bot_name: 机器人展示名（当前仅用于上游构建，序列化阶段不必依赖）。
+            chat: 聊天引用信息。
+
+        Returns:
+            行列表（不包含外层 `<CQCTX/...>` 包裹）。
+        """
         rows: list[str] = []
         for line in messages:
             sender_ref = self._sender_ref(
@@ -988,7 +1020,14 @@ class NapCatContextBuilder:
 
 
 class NapCatMessageParser:
-    """消息解析器：只解析指定的 9 种 segment 类型，产出 CQ 风格 `m`。"""
+    """解析 OneBot message 段为简化的 CQ 文本。
+
+    该解析器只处理约定的 9 种 segment 类型，并把它们统一渲染为 CQ 风格的
+    文本 `m`（供上下文构建与触发判断使用）。
+
+    未支持的 segment 会被降级为占位文本（例如 `[CQ:foo]`），避免把未知结构
+    直接透传到后续链路。
+    """
 
     # 解析 CQ 码的最小正则：匹配形如 [CQ:type,k=v,...]
     # 注意：这里不要写成 \\[CQ:...，否则会变成匹配字面量“\[CQ:”而不是“[CQ:”。
@@ -1012,6 +1051,15 @@ class NapCatMessageParser:
     }
 
     def parse(self, *, payload: dict[str, Any], self_id: str) -> ParsedMessage:
+        """解析 OneBot message payload。
+
+        Args:
+            payload: OneBot v11 message 事件 payload。
+            self_id: 机器人自身 ID（用于部分字段归一化；当前主要用于保留接口一致性）。
+
+        Returns:
+            解析后的 `ParsedMessage`，其中 `m` 为 CQ 风格的文本。
+        """
         # 兼容 string/array
         message = payload.get("message")
         raw_message = payload.get("raw_message")
@@ -1032,6 +1080,15 @@ class NapCatMessageParser:
         return ParsedMessage()
 
     def parse_unsupported_segment(self, *, seg_type: str, data: dict[str, Any]) -> ParsedSegment:
+        """把未支持的 segment 降级为可读占位。
+
+        Args:
+            seg_type: segment 类型。
+            data: segment data（当前未使用，仅用于保留调试信息入口）。
+
+        Returns:
+            一个 text 类型的 `ParsedSegment`，内容为 `[CQ:{seg_type}]`。
+        """
         # 占位：输出 [CQ:type]
         return ParsedSegment(type="text", data={"text": f"[CQ:{seg_type}]"})
 
@@ -1047,6 +1104,18 @@ class NapCatMessageParser:
         return ""
 
     def _parse_array(self, message: list[dict[str, Any]]) -> ParsedMessage:
+        """解析 OneBot 的 array message。
+
+        Args:
+            message: segment 数组，每个元素通常形如 `{type: ..., data: ...}`。
+
+        Returns:
+            解析后的消息结构，其中包含：
+            - `cq_text`: 精简 CQ 文本
+            - `plain_text`: 仅文本部分
+            - `segments`: 原始 segment（做过最小清洗）
+            - `reply_id/forward_id/at_qq/media`: 解析出来的结构化字段
+        """
         out = ParsedMessage()
         parts_cq: list[str] = []
         parts_plain: list[str] = []
