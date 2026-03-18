@@ -422,6 +422,20 @@ class ParsedSegment:
 
 
 @dataclass(slots=True)
+class ParsedSegmentResult:
+    """单个消息段归一化后的中间结果。"""
+
+    segment: ParsedSegment
+    cq_part: str = ""
+    plain_part: str = ""
+    at_qq: str = ""
+    reply_id: str = ""
+    forward_id: str = ""
+    media_urls: list[str] = field(default_factory=list)
+    media_meta: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class ParsedMessage:
     """消息解析后的统一输出。
 
@@ -1249,6 +1263,71 @@ class NapCatMessageParser:
                 return s
         return ""
 
+    @staticmethod
+    def _append_segment_result(out: ParsedMessage, result: ParsedSegmentResult) -> None:
+        """把单个 segment 归一化结果合并到 ParsedMessage。"""
+
+        if result.cq_part:
+            out.cq_text += result.cq_part
+        if result.plain_part:
+            out.plain_text += result.plain_part
+        if result.at_qq:
+            out.at_qq.append(result.at_qq)
+        if result.reply_id and not out.reply_id:
+            out.reply_id = result.reply_id
+        if result.forward_id and not out.forward_id:
+            out.forward_id = result.forward_id
+        if result.media_urls:
+            out.media.extend(result.media_urls)
+        if result.media_meta:
+            out.media_meta.extend(result.media_meta)
+        out.segments.append(result.segment)
+
+    def _parse_segment_result(self, *, seg_type: str, kv: dict[str, Any]) -> ParsedSegmentResult:
+        """把单个 segment 归一化为统一中间结果。"""
+
+        field_keys = self._CQ_FIELD_MAP.get(seg_type)
+        if field_keys is None:
+            unsupported = self.parse_unsupported_segment(seg_type=seg_type, data=kv)
+            return ParsedSegmentResult(segment=unsupported, cq_part=f"[CQ:{seg_type}]")
+
+        field_val = self._first_non_empty(kv, field_keys)
+        result = ParsedSegmentResult(
+            segment=(
+                ParsedSegment(type="text", data={"text": field_val})
+                if seg_type == "text"
+                else ParsedSegment(type=seg_type, data=kv)
+            )
+        )
+
+        if seg_type == "text":
+            result.cq_part = field_val
+            result.plain_part = field_val
+            return result
+
+        if seg_type == "at" and field_val and field_val != "all":
+            result.at_qq = field_val
+        elif seg_type == "reply" and field_val:
+            result.reply_id = field_val
+        elif seg_type == "forward" and field_val:
+            result.forward_id = field_val
+        elif seg_type == "image":
+            url = str(kv.get("url") or "").strip()
+            if url.startswith("https://"):
+                result.media_urls.append(url)
+                result.media_meta.append(
+                    {
+                        "type": "image",
+                        "url": url,
+                        "file": str(kv.get("file") or kv.get("name") or "").strip(),
+                    }
+                )
+
+        result.cq_part = (
+            f"[CQ:{seg_type},{field_keys[0]}={field_val}]" if field_val else f"[CQ:{seg_type}]"
+        )
+        return result
+
     def _parse_array(self, message: list[dict[str, Any]]) -> ParsedMessage:
         """解析 OneBot 的 array message。
 
@@ -1263,62 +1342,20 @@ class NapCatMessageParser:
             - `reply_id/forward_id/at_qq/media`: 解析出来的结构化字段
         """
         out = ParsedMessage()
-        parts_cq: list[str] = []
-        parts_plain: list[str] = []
 
         for seg in message:
             if not isinstance(seg, dict):
                 continue
             seg_type = str(seg.get("type") or "").strip()
             data = seg.get("data")
-            if not isinstance(data, dict):
-                data = {}
-            kv: dict[str, Any] = dict(data)
+            kv = dict(data) if isinstance(data, dict) else {}
+            self._append_segment_result(
+                out,
+                self._parse_segment_result(seg_type=seg_type, kv=kv),
+            )
 
-            field_keys = self._CQ_FIELD_MAP.get(seg_type)
-            if field_keys is None:
-                # 不支持的类型：占位
-                parts_cq.append(f"[CQ:{seg_type}]")
-                continue
-
-            field_val = self._first_non_empty(kv, field_keys)
-
-            # 特殊副作用：at/reply/forward 需要写入 out 的字段
-            if seg_type == "at" and field_val and field_val != "all":
-                out.at_qq.append(field_val)
-            elif seg_type == "reply" and field_val and not out.reply_id:
-                out.reply_id = field_val
-            elif seg_type == "forward" and field_val and not out.forward_id:
-                out.forward_id = field_val
-            elif seg_type == "image":
-                url = str(kv.get("url") or "").strip()
-                if url.startswith("https://"):
-                    out.media.append(url)
-                    out.media_meta.append(
-                        {
-                            "type": "image",
-                            "url": url,
-                            "file": str(kv.get("file") or kv.get("name") or "").strip(),
-                        }
-                    )
-
-            # 构建精简 CQ
-            if seg_type == "text":
-                if field_val:
-                    parts_cq.append(field_val)
-                    parts_plain.append(field_val)
-                out.segments.append(ParsedSegment(type="text", data={"text": field_val}))
-            else:
-                cq_str = (
-                    f"[CQ:{seg_type},{field_keys[0]}={field_val}]"
-                    if field_val
-                    else f"[CQ:{seg_type}]"
-                )
-                parts_cq.append(cq_str)
-                out.segments.append(ParsedSegment(type=seg_type, data=kv))
-
-        out.cq_text = "".join(parts_cq).strip()
-        out.plain_text = "".join(parts_plain).strip()
+        out.cq_text = out.cq_text.strip()
+        out.plain_text = out.plain_text.strip()
         return out
 
     def _parse_cq_string(self, s: str) -> ParsedMessage:
@@ -1335,19 +1372,20 @@ class NapCatMessageParser:
         if not txt:
             return out
 
-        parts_cq: list[str] = []
-        parts_plain: list[str] = []
-
         pos = 0
         for m in self._cq_re.finditer(txt):
             start, end = m.span()
-            # leading text
             if start > pos:
                 t = txt[pos:start]
                 if t:
-                    parts_cq.append(t)
-                    parts_plain.append(t)
-                    out.segments.append(ParsedSegment(type="text", data={"text": t}))
+                    self._append_segment_result(
+                        out,
+                        ParsedSegmentResult(
+                            segment=ParsedSegment(type="text", data={"text": t}),
+                            cq_part=t,
+                            plain_part=t,
+                        ),
+                    )
 
             seg_type = str(m.group(1) or "").strip()
             rest = m.group(2) or ""
@@ -1358,50 +1396,26 @@ class NapCatMessageParser:
                         k, v = item.split("=", 1)
                         kv[k.strip()] = v.strip()
 
-            field_keys = self._CQ_FIELD_MAP.get(seg_type)
-            if field_keys is None:
-                # 暂不支持：占位（不保留参数，避免超长）
-                parts_cq.append(f"[CQ:{seg_type}]")
-                pos = end
-                continue
-
-            field_val = self._first_non_empty(kv, field_keys)
-
-            # 特殊副作用：at/reply/forward 需要写入 out 的字段
-            if seg_type == "at" and field_val and field_val != "all":
-                out.at_qq.append(field_val)
-            elif seg_type == "reply" and field_val and not out.reply_id:
-                out.reply_id = field_val
-            elif seg_type == "forward" and field_val and not out.forward_id:
-                out.forward_id = field_val
-
-            if seg_type == "text":
-                # CQ 字符串里几乎不会出现，但保留
-                if field_val:
-                    parts_cq.append(field_val)
-                    parts_plain.append(field_val)
-                out.segments.append(ParsedSegment(type="text", data={"text": field_val}))
-            else:
-                cq_str = (
-                    f"[CQ:{seg_type},{field_keys[0]}={field_val}]"
-                    if field_val
-                    else f"[CQ:{seg_type}]"
-                )
-                parts_cq.append(cq_str)
-                out.segments.append(ParsedSegment(type=seg_type, data=kv))
-
+            self._append_segment_result(
+                out,
+                self._parse_segment_result(seg_type=seg_type, kv=kv),
+            )
             pos = end
 
-        # trailing text
         if pos < len(txt):
             t = txt[pos:]
             if t:
-                parts_cq.append(t)
-                parts_plain.append(t)
-                out.segments.append(ParsedSegment(type="text", data={"text": t}))
+                self._append_segment_result(
+                    out,
+                    ParsedSegmentResult(
+                        segment=ParsedSegment(type="text", data={"text": t}),
+                        cq_part=t,
+                        plain_part=t,
+                    ),
+                )
 
-        out.cq_text = "".join(parts_cq).strip()
-        out.plain_text = "".join(parts_plain).strip()
+        out.cq_text = out.cq_text.strip()
+        out.plain_text = out.plain_text.strip()
         return out
 
 
