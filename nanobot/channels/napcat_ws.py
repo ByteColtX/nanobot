@@ -2347,32 +2347,7 @@ class NapCatTransport:
         while self._running:
             ws: ClientConnection | None = None
             try:
-                headers: dict[str, str] = {}
-                if getattr(self.config, "token", ""):
-                    headers["Authorization"] = f"Bearer {self.config.token}"
-
-                # Match legacy transport defaults (from napcat_ws.py.bak)
-                connect_kwargs: dict[str, Any] = {
-                    "open_timeout": 10,
-                    "ping_interval": 20,
-                    "ping_timeout": 20,
-                    "close_timeout": 10,
-                }
-
-                # Normalize url: ensure it ends with "/" for NapCat.
-                url = self._normalize_ws_url(self.config.url)
-
-                # websockets 版本差异：v12 使用 additional_headers；旧版使用 extra_headers
-                connect_kwargs["additional_headers"] = headers or None
-
-                try:
-                    ws = await websockets.connect(url, **connect_kwargs)
-                except TypeError:
-                    # websockets<12
-                    connect_kwargs.pop("additional_headers", None)
-                    connect_kwargs["extra_headers"] = headers or None
-                    ws = await websockets.connect(url, **connect_kwargs)
-
+                url, ws = await self._connect_ws()
                 self._ws = ws
                 logger.info("napcat_ws transport connected: {}", url)
 
@@ -2421,6 +2396,41 @@ class NapCatTransport:
         self._cancel_event_tasks()
         self._cancel_login_task()
         self._fail_pending_futures()
+
+    @staticmethod
+    def _build_connect_headers(token: str) -> dict[str, str] | None:
+        """构造 websocket 连接头。"""
+
+        token_value = str(token or "").strip()
+        if not token_value:
+            return None
+        return {"Authorization": f"Bearer {token_value}"}
+
+    @staticmethod
+    def _build_connect_kwargs(headers: dict[str, str] | None) -> dict[str, Any]:
+        """构造 websocket connect 参数。"""
+
+        return {
+            "open_timeout": 10,
+            "ping_interval": 20,
+            "ping_timeout": 20,
+            "close_timeout": 10,
+            "additional_headers": headers,
+        }
+
+    async def _connect_ws(self) -> tuple[str, ClientConnection]:
+        """建立 websocket 连接，并兼容旧版 websockets 参数名。"""
+
+        url = self._normalize_ws_url(self.config.url)
+        headers = self._build_connect_headers(self.config.token)
+        connect_kwargs = self._build_connect_kwargs(headers)
+        try:
+            ws = await websockets.connect(url, **connect_kwargs)
+        except TypeError:
+            connect_kwargs.pop("additional_headers", None)
+            connect_kwargs["extra_headers"] = headers
+            ws = await websockets.connect(url, **connect_kwargs)
+        return url, ws
 
     async def _cleanup_connection(self, ws: ClientConnection | None) -> None:
         """清理单次连接相关状态。"""
