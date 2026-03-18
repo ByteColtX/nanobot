@@ -3102,6 +3102,16 @@ class NapCatWSChannel(BaseChannel):
     def _build_chat_context(
         self, *, msg: NormalizedInbound, session_key: str, bot_name: str
     ) -> str:
+        """构建本轮发给 agent 的上下文内容。
+
+        Args:
+            msg: 已归一化/补全后的入站消息。
+            session_key: 会话 key。
+            bot_name: 在群内展示的 bot 名字（用于上下文构建）。
+
+        Returns:
+            序列化后的上下文文本。
+        """
         hist_limit = int(getattr(self.config, "context_max_messages", 20) or 20)
         hist = self._store.recent_messages(session_key, hist_limit)
 
@@ -3115,6 +3125,15 @@ class NapCatWSChannel(BaseChannel):
         )
 
     async def _enrich_message(self, msg: NormalizedInbound) -> None:
+        """补全入站消息的引用/转发/媒体。
+
+        该步骤会下载本条消息内的图片、展开引用消息（reply）与合并转发（forward），
+        并把转发节点里的媒体路径聚合到 `msg.media_paths`，确保后续构建 agent 输入时
+        能把“本轮可见图片”一并传入。
+
+        Args:
+            msg: 需要补全的入站消息（原地修改）。
+        """
         msg.media_paths = await self._download_images_from_message(msg.raw_event.get("message"))
 
         await self._expand_quote(msg)
@@ -3134,6 +3153,12 @@ class NapCatWSChannel(BaseChannel):
             pass
 
     async def _cache_message_line(self, *, msg: NormalizedInbound, session_key: str) -> None:
+        """把当前消息写入 session buffer。
+
+        Args:
+            msg: 已 enrich 的入站消息。
+            session_key: 会话 key。
+        """
         # 始终缓存一条 JSON line（用于构建 <NAPCAT_WS_CONTEXT>）
         try:
             context_line = await self._build_context_line(msg)
@@ -3148,6 +3173,20 @@ class NapCatWSChannel(BaseChannel):
             logger.debug("napcat_ws build_context_line_failed err={}", exc)
 
     def _collect_visible_media(self, *, msg: NormalizedInbound, session_key: str) -> list[str]:
+        """汇总本轮对模型“可见”的媒体文件路径。
+
+        会合并：
+        - 当前消息的图片（`msg.media_paths`）
+        - 引用消息的图片（`msg.reply.media_paths`）
+        - 历史窗口中缓存的图片（`ContextMessageLine.media_paths`）
+
+        Args:
+            msg: 已 enrich 的入站消息。
+            session_key: 会话 key。
+
+        Returns:
+            去重后的本地文件路径列表。
+        """
         # 关键修复：历史/引用/合并转发图片的可见性。
         # - 当前消息图片：msg.media_paths
         # - 引用消息图片：msg.reply.media_paths
@@ -3189,6 +3228,18 @@ class NapCatWSChannel(BaseChannel):
         merged_media: list[str],
         decision: TriggerDecision,
     ) -> InboundMessage:
+        """构造并发布给 agent 的入站消息对象。
+
+        Args:
+            msg: 入站消息。
+            session_key: 会话 key。
+            content: 发给 agent 的文本内容（通常是拼好的上下文）。
+            merged_media: 本轮可见的本地媒体路径列表。
+            decision: 触发决策信息（用于写入 metadata）。
+
+        Returns:
+            `InboundMessage` 实例。
+        """
         return InboundMessage(
             channel=self.name,
             sender_id=str(msg.sender_id),
@@ -3209,6 +3260,13 @@ class NapCatWSChannel(BaseChannel):
         )
 
     async def _handle_message(self, payload: dict[str, Any]) -> None:
+        """处理 OneBot message 事件。
+
+        流程：normalize -> enrich -> decide trigger -> cache -> build context -> publish inbound。
+
+        Args:
+            payload: OneBot message 事件 payload。
+        """
         msg = normalize_inbound(
             payload,
             self_id=str(self._self_id or ""),
@@ -3278,6 +3336,11 @@ class NapCatWSChannel(BaseChannel):
         return
 
     async def _expand_quote(self, msg: NormalizedInbound) -> None:
+        """展开引用消息（quote/reply）。
+
+        Args:
+            msg: 入站消息（原地修改其 `reply` 字段）。
+        """
         if msg.reply is None or not msg.reply.message_id:
             return
 
