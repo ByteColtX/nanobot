@@ -3707,6 +3707,14 @@ class NapCatWSChannel(BaseChannel):
             return False
 
     def _build_forward_summary(self, items: list[dict[str, Any]]) -> str:
+        """生成合并转发的摘要文本。
+
+        Args:
+            items: forward 节点列表（标准化 dict）。
+
+        Returns:
+            逐行摘要文本（带保守长度截断）。
+        """
         lines: list[str] = []
         for item in items:
             who = str(item.get("sender_name") or item.get("sender_id") or "unknown")
@@ -3754,6 +3762,11 @@ class NapCatWSChannel(BaseChannel):
     # ------------------------------
 
     def _log_inbound(self, msg: NormalizedInbound) -> None:
+        """输出入站消息的调试日志。
+
+        Args:
+            msg: 入站消息。
+        """
         reply_id = msg.reply.message_id if msg.reply else ""
         forward_id = msg.forward_id or ""
         forward_items = len(msg.forward_items or [])
@@ -3773,6 +3786,7 @@ class NapCatWSChannel(BaseChannel):
         )
 
     def _log_message_decision(self, decision: TriggerDecision) -> None:
+        """输出 message 触发决策的调试日志。"""
         logger.debug(
             "napcat_ws message decision should_reply={} reason={} trigger={} probability={}",
             decision.should_reply,
@@ -3782,6 +3796,7 @@ class NapCatWSChannel(BaseChannel):
         )
 
     def _log_notice_decision(self, decision: TriggerDecision) -> None:
+        """输出 notice 触发决策的调试日志。"""
         logger.debug(
             "napcat_ws notice decision should_reply={} reason={} trigger={} probability={}",
             decision.should_reply,
@@ -3791,6 +3806,11 @@ class NapCatWSChannel(BaseChannel):
         )
 
     def _log_ignored_event(self, payload: dict[str, Any]) -> None:
+        """输出被忽略事件的调试日志。
+
+        Args:
+            payload: 原始 OneBot payload。
+        """
         post_type = str(payload.get("post_type") or "")
         if not post_type:
             return
