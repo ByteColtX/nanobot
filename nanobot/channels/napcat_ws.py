@@ -42,12 +42,14 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Deque, Literal, Optional
+from typing import Any, Awaitable, Callable, Deque, Literal, Optional
 from urllib.parse import urlparse, urlunparse
 from urllib.request import Request, urlopen
 
+import websockets
 from loguru import logger
 from pydantic import Field
+from websockets import ClientConnection
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -174,22 +176,6 @@ class NapCatWSConfig(Base):
 
 
 # NOTE: transport 层也会用到 OneBot action 常量（get_login_info）
-
-# ==============================
-# 0.2) Transport deps
-# ==============================
-
-if TYPE_CHECKING:
-    from websockets import ClientConnection
-
-try:
-    import websockets
-except ImportError:  # pragma: no cover
-    websockets = None
-    WEBSOCKETS_INSTALLED = False
-else:
-    WEBSOCKETS_INSTALLED = True
-
 
 # ==============================
 # 1) Types & constants
@@ -2353,9 +2339,6 @@ class NapCatTransport:
             - action_response 会在本层被消费（根据 status/retcode 或 echo 命中 pending）。
         """
 
-        if not WEBSOCKETS_INSTALLED:
-            raise RuntimeError("websockets dependency is not installed")
-
         if self._running:
             return
         self._running = True
@@ -2774,9 +2757,6 @@ class NapCatWSChannel(BaseChannel):
 
     async def start(self) -> None:
         """启动渠道。"""
-
-        if not WEBSOCKETS_INSTALLED:
-            raise RuntimeError("websockets dependency is not installed")
 
         self._running = True
         logger.info("{} starting", self.name)
