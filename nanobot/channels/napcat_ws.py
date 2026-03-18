@@ -498,6 +498,19 @@ def _json_dumps_compact(obj: Any) -> str:
 
 
 def _cqctx_escape(text: str) -> str:
+    """对 CQCtx body 文本做转义。
+
+    该转义用于 CQCtxBodyEncoder 输出，确保以下字符不会破坏内部编码：
+    - 反斜杠 `\\`
+    - 分隔符 `|`
+    - 换行 `\n`
+
+    Args:
+        text: 原始文本。
+
+    Returns:
+        转义后的文本。
+    """
     s = str(text or "")
     s = s.replace("\\", "\\\\")
     s = s.replace("|", "\\|")
@@ -506,6 +519,17 @@ def _cqctx_escape(text: str) -> str:
 
 
 def _cqctx_filename_from_path(path: str) -> str:
+    """从文件路径提取一个安全的文件名。
+
+    主要用于把本地路径映射为可嵌入 CQCtx 的短文件名，避免把上游的奇怪文件名
+    原样带入。
+
+    Args:
+        path: 任意形式的路径字符串。
+
+    Returns:
+        安全的文件名；提取失败时返回空字符串。
+    """
     try:
         return _safe_media_filename(Path(str(path or "")).name)
     except Exception:
@@ -513,6 +537,14 @@ def _cqctx_filename_from_path(path: str) -> str:
 
 
 class _CQCtxSymbolTable:
+    """CQCtx 编码过程用到的符号表。
+
+    该符号表负责为用户、图片、转发节点等实体分配短引用（ref），并同步维护
+    `CQCtxReverseMap`，用于在需要时从短引用反查回真实平台标识。
+
+    该类只服务于 CQCtx 编码链路，不应当被业务逻辑直接依赖。
+    """
+
     def __init__(self) -> None:
         self.user_by_qq: dict[str, str] = {}
         self.user_rows: list[dict[str, Any]] = []
@@ -563,6 +595,19 @@ class _CQCtxSymbolTable:
 
 
 class _CQCtxBodyEncoder:
+    """把渲染文本中的 CQ token 编码成 CQCtx body。
+
+    输入通常是包含形如 `[CQ:type,key=value]` 的渲染文本。
+    编码后会输出一种更紧凑且可逆的内部表示，并通过 `_CQCtxSymbolTable` 把
+    用户/图片等实体映射为短引用。
+
+    该编码仅用于上下文注入，不用于出站发送。
+
+    Args:
+        symbols: CQCtx 符号表。
+        is_group: 是否为群聊（影响 at/reply 等 token 的处理策略）。
+    """
+
     _token_re = re.compile(r"\[CQ:([^,\]]+)(?:,([^\]]+))?\]")
 
     def __init__(self, *, symbols: _CQCtxSymbolTable, is_group: bool) -> None:
@@ -1740,6 +1785,15 @@ _CQ_OUTBOUND_RE = re.compile(r"\[CQ:([^,\]]+)(?:,([^\]]+))?\]")
 
 
 def _parse_cq_params(params_raw: str) -> dict[str, str]:
+    """解析 CQ 参数串。
+
+    Args:
+        params_raw: CQ token 的参数区（不包含前缀类型），例如：
+            `"qq=123,id=456"`。
+
+    Returns:
+        解析后的 key/value 字典。无法解析的片段会被忽略。
+    """
     params: dict[str, str] = {}
     if not params_raw:
         return params
@@ -1758,6 +1812,14 @@ def _parse_cq_params(params_raw: str) -> dict[str, str]:
 
 
 def _file_uri_to_local_path(file_uri: str) -> str | None:
+    """把 `file://` URI 转换为本地文件路径。
+
+    Args:
+        file_uri: 形如 `file:///abs/path/to/a.png` 的 URI。
+
+    Returns:
+        对应的本地路径字符串；若不是 file URI 或无法解析则返回 None。
+    """
     raw = str(file_uri or "").strip()
     if not raw:
         return None
