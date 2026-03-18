@@ -1264,6 +1264,17 @@ class NapCatMessageParser:
         return ""
 
     @staticmethod
+    def _build_text_segment_result(text: str) -> ParsedSegmentResult:
+        """构造纯文本 segment 的统一结果。"""
+
+        value = str(text or "")
+        return ParsedSegmentResult(
+            segment=ParsedSegment(type="text", data={"text": value}),
+            cq_part=value,
+            plain_part=value,
+        )
+
+    @staticmethod
     def _append_segment_result(out: ParsedMessage, result: ParsedSegmentResult) -> None:
         """把单个 segment 归一化结果合并到 ParsedMessage。"""
 
@@ -1294,16 +1305,14 @@ class NapCatMessageParser:
         field_val = self._first_non_empty(kv, field_keys)
         result = ParsedSegmentResult(
             segment=(
-                ParsedSegment(type="text", data={"text": field_val})
+                self._build_text_segment_result(field_val).segment
                 if seg_type == "text"
                 else ParsedSegment(type=seg_type, data=kv)
             )
         )
 
         if seg_type == "text":
-            result.cq_part = field_val
-            result.plain_part = field_val
-            return result
+            return self._build_text_segment_result(field_val)
 
         if seg_type == "at" and field_val and field_val != "all":
             result.at_qq = field_val
@@ -1378,14 +1387,7 @@ class NapCatMessageParser:
             if start > pos:
                 t = txt[pos:start]
                 if t:
-                    self._append_segment_result(
-                        out,
-                        ParsedSegmentResult(
-                            segment=ParsedSegment(type="text", data={"text": t}),
-                            cq_part=t,
-                            plain_part=t,
-                        ),
-                    )
+                    self._append_segment_result(out, self._build_text_segment_result(t))
 
             seg_type = str(m.group(1) or "").strip()
             rest = m.group(2) or ""
@@ -1405,14 +1407,7 @@ class NapCatMessageParser:
         if pos < len(txt):
             t = txt[pos:]
             if t:
-                self._append_segment_result(
-                    out,
-                    ParsedSegmentResult(
-                        segment=ParsedSegment(type="text", data={"text": t}),
-                        cq_part=t,
-                        plain_part=t,
-                    ),
-                )
+                self._append_segment_result(out, self._build_text_segment_result(t))
 
         out.cq_text = out.cq_text.strip()
         out.plain_text = out.plain_text.strip()
