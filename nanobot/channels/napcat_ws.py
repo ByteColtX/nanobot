@@ -2984,21 +2984,8 @@ class NapCatWSChannel(BaseChannel):
         chat = self._build_notice_chat(actor_id=actor, group_id=group_id)
         session_key = make_session_key(chat)
 
-        # 戳一戳冷却（可配置）。key 以 chat 为粒度：群=group_id，私聊=user_id。
-        cooldown_s = int(getattr(self.config, "poke_cooldown_seconds", 60) or 0)
-
-        if cooldown_s > 0:
-            now_ts = time.time()
-            cooldown_key = f"{chat.chat_type}:{chat.chat_id}"
-            last_ts = float(self._poke_last_ts_by_chat.get(cooldown_key) or 0.0)
-            if last_ts and (now_ts - last_ts) < float(cooldown_s):
-                logger.debug(
-                    "napcat_ws poke_cooldown key={} limit_s={}",
-                    cooldown_key,
-                    cooldown_s,
-                )
-                return
-            self._poke_last_ts_by_chat[cooldown_key] = now_ts
+        if not self._consume_notice_cooldown(chat=chat):
+            return
 
         event_id, notice_type, sub_type, ts_i = self._build_notice_event_id(
             payload=payload,
@@ -3028,6 +3015,27 @@ class NapCatWSChannel(BaseChannel):
             decision=decision,
         )
         return
+
+    def _consume_notice_cooldown(self, *, chat: ChatRef) -> bool:
+        """检查并消费 notice 冷却；命中冷却返回 False。"""
+
+        cooldown_s = int(getattr(self.config, "poke_cooldown_seconds", 60) or 0)
+        if cooldown_s <= 0:
+            return True
+
+        now_ts = time.time()
+        cooldown_key = f"{chat.chat_type}:{chat.chat_id}"
+        last_ts = float(self._poke_last_ts_by_chat.get(cooldown_key) or 0.0)
+        if last_ts and (now_ts - last_ts) < float(cooldown_s):
+            logger.debug(
+                "napcat_ws poke_cooldown key={} limit_s={}",
+                cooldown_key,
+                cooldown_s,
+            )
+            return False
+
+        self._poke_last_ts_by_chat[cooldown_key] = now_ts
+        return True
 
     def _build_notice_chat(self, *, actor_id: str, group_id: str) -> ChatRef:
         """根据 notice 发起者与群号构造 chat 引用。"""
