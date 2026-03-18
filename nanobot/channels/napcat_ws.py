@@ -35,7 +35,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import random
 import re
 import shutil
 import time
@@ -43,7 +42,7 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Deque, Dict, Literal, Optional
+from typing import Any, Awaitable, Callable, Deque, Literal, Optional
 from urllib.parse import urlparse, urlunparse
 from urllib.request import Request, urlopen
 
@@ -55,7 +54,6 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
-
 
 # ==============================
 # 0) Pure helpers
