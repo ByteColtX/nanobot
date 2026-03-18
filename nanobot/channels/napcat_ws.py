@@ -61,9 +61,15 @@ from nanobot.config.schema import Base
 
 
 def summarize_onebot_event(payload: dict[str, Any]) -> str:
-    """Build a compact summary string for logs.
+    """生成用于日志的 OneBot 事件摘要。
 
-    Keep it stable and low-cardinality; never include full message content.
+    要求：输出应尽量稳定、低基数（low-cardinality），并且绝不包含完整消息正文。
+
+    Args:
+        payload: OneBot 事件 payload。
+
+    Returns:
+        形如 `key=value` 的紧凑摘要字符串；如果 payload 非法或关键信息为空，则返回占位值。
     """
 
     if not isinstance(payload, dict):
@@ -454,7 +460,7 @@ class ExpandedReply:
 
     与 ContextMessageLine 的约定（已定稿）：
       - 当前消息的 `m` 字段内仍保留 inline 的 `[CQ:reply,id=...]`（以及用户实际追加的文本）
-      - 被引用的“原消息”展开内容放到 ContextMessageLine.r（方案 A：只保留 {"u","m"}）
+      - 被引用的“原消息”展开内容放到 ContextMessageLine.r（仅保留 {"u","m"}）
       - 如果“原消息”本身包含 forward，可填充到 forward 字段（后续可继续展开）
 
     注意：这里只定义数据结构；拉取/解析/截断规则后续实现。
@@ -504,7 +510,7 @@ class ContextMessageLine:
 #   - 这部分落地“解析/展开/缓存/上下文构建”的最小闭环，并被 normalize/channel 主链路直接使用。
 #   - 仍只支持 9 种 segment 类型：text/face/image/at/reply/forward/record/video/file。
 #   - 其它类型输出占位 token（[CQ:type]），后续按需扩展。
-#   - Header 不包含 group_name（按你的要求）。
+#   - Header 不包含 group_name。
 #
 
 
@@ -3590,7 +3596,7 @@ class NapCatWSChannel(BaseChannel):
     async def _download_images_from_message(self, message: Any) -> list[str]:
         """将 message segments 中的图片下载到本地 media 目录。
 
-        策略（按你的要求，方案 A）：
+        策略：
         - 总是下载（已存在就跳过）
         - 仅支持 https
         - 文件名直接使用消息体里的 file/name（通常本身就是 hash）
