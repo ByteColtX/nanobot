@@ -42,7 +42,7 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Deque, Literal, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Deque, Literal, Optional
 from urllib.parse import urlparse, urlunparse
 from urllib.request import Request, urlopen
 
@@ -179,15 +179,16 @@ class NapCatWSConfig(Base):
 # 0.2) Transport deps
 # ==============================
 
-try:
-    import websockets
+if TYPE_CHECKING:
     from websockets import ClientConnection
 
-    WEBSOCKETS_AVAILABLE = True
+try:
+    import websockets
 except ImportError:  # pragma: no cover
     websockets = None
-    ClientConnection = Any
-    WEBSOCKETS_AVAILABLE = False
+    WEBSOCKETS_INSTALLED = False
+else:
+    WEBSOCKETS_INSTALLED = True
 
 
 # ==============================
@@ -2352,7 +2353,7 @@ class NapCatTransport:
             - action_response 会在本层被消费（根据 status/retcode 或 echo 命中 pending）。
         """
 
-        if not WEBSOCKETS_AVAILABLE:
+        if not WEBSOCKETS_INSTALLED:
             raise RuntimeError("websockets dependency is not installed")
 
         if self._running:
@@ -2402,47 +2403,13 @@ class NapCatTransport:
                     if not self._running:
                         break
 
-                    try:
-                        if isinstance(raw, (bytes, bytearray)):
-                            raw = bytes(raw).decode("utf-8", "ignore")
-                        payload = json.loads(raw)
-                        if not isinstance(payload, dict):
-                            continue
-                    except Exception as e:
-                        logger.warning("napcat_ws transport invalid_frame err={}", e)
+                    payload = self._decode_payload(raw)
+                    if payload is None:
                         continue
 
-                    # 1) action_response：优先按旧实现识别（status+retcode），避免被当作普通事件分发。
-                    if ("status" in payload) and ("retcode" in payload):
-                        echo = payload.get("echo")
-                        if echo is not None:
-                            key = str(echo)
-                            fut = self._pending.pop(key, None)
-                            if fut is not None and not fut.done():
-                                logger.debug(
-                                    "napcat_ws action_recv echo={} status={} retcode={}",
-                                    key,
-                                    payload.get("status"),
-                                    payload.get("retcode"),
-                                )
-                                fut.set_result(payload)
-                        else:
-                            logger.debug(
-                                "napcat_ws transport action_missing_echo keys={}",
-                                sorted(payload.keys()),
-                            )
+                    if self._resolve_pending_response(payload):
                         continue
 
-                    # 2) action_response：兼容实现差异——只要 echo 命中 pending 就消化。
-                    echo = payload.get("echo")
-                    if echo is not None:
-                        key = str(echo)
-                        fut = self._pending.pop(key, None)
-                        if fut is not None and not fut.done():
-                            fut.set_result(payload)
-                            continue
-
-                    # 3) 普通事件：以 task 方式上抛给 channel（避免阻塞接收循环）
                     self._spawn_event_task(payload)
 
             except Exception as e:
@@ -2532,6 +2499,47 @@ class NapCatTransport:
                 logger.exception("napcat_ws transport on_event_failed summary={}", summary)
 
         task.add_done_callback(_done)
+
+    @staticmethod
+    def _decode_payload(raw: str | bytes | bytearray) -> dict[str, Any] | None:
+        """把 websocket frame 解码成 dict payload。"""
+
+        try:
+            if isinstance(raw, (bytes, bytearray)):
+                raw = bytes(raw).decode("utf-8", "ignore")
+            payload = json.loads(raw)
+            return payload if isinstance(payload, dict) else None
+        except Exception as e:
+            logger.warning("napcat_ws transport invalid_frame err={}", e)
+            return None
+
+    def _resolve_pending_response(self, payload: dict[str, Any]) -> bool:
+        """处理命中 pending 的 action 响应。"""
+
+        echo = payload.get("echo")
+        if echo is None:
+            if ("status" in payload) and ("retcode" in payload):
+                logger.debug(
+                    "napcat_ws transport action_missing_echo keys={}",
+                    sorted(payload.keys()),
+                )
+                return True
+            return False
+
+        key = str(echo)
+        fut = self._pending.pop(key, None)
+        if fut is None or fut.done():
+            return ("status" in payload) and ("retcode" in payload)
+
+        if ("status" in payload) and ("retcode" in payload):
+            logger.debug(
+                "napcat_ws action_recv echo={} status={} retcode={}",
+                key,
+                payload.get("status"),
+                payload.get("retcode"),
+            )
+        fut.set_result(payload)
+        return True
 
     @staticmethod
     def _normalize_ws_url(url: str) -> str:
@@ -2767,7 +2775,7 @@ class NapCatWSChannel(BaseChannel):
     async def start(self) -> None:
         """启动渠道。"""
 
-        if not WEBSOCKETS_AVAILABLE:
+        if not WEBSOCKETS_INSTALLED:
             raise RuntimeError("websockets dependency is not installed")
 
         self._running = True
