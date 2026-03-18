@@ -2965,15 +2965,8 @@ class NapCatWSChannel(BaseChannel):
             return
 
         sender_name = self._extract_notice_actor_name(payload, fallback=actor)
-
         group_id = self._extract_group_id(payload)
-
-        chat = ChatRef(
-            chat_type="group" if group_id else "private",
-            chat_id=str(group_id or actor),
-            user_id=str(actor),
-            group_id=str(group_id or ""),
-        )
+        chat = self._build_notice_chat(actor_id=actor, group_id=group_id)
         session_key = make_session_key(chat)
 
         # 戳一戳冷却（可配置）。key 以 chat 为粒度：群=group_id，私聊=user_id。
@@ -2992,29 +2985,18 @@ class NapCatWSChannel(BaseChannel):
                 return
             self._poke_last_ts_by_chat[cooldown_key] = now_ts
 
-        # 生成“事件 id”：notice 没有 message_id，避免使用空字符串造成上下文难以定位
-        notice_type = str(payload.get("notice_type") or "notice").strip() or "notice"
-        sub_type = str(payload.get("sub_type") or payload.get("notify_type") or "").strip() or ""
-        ts_raw = payload.get("time")
-        try:
-            ts_i = int(ts_raw) if ts_raw is not None else int(time.time())
-        except Exception:
-            ts_i = int(time.time())
-        event_id = f"notice:{notice_type}:{sub_type}:{ts_i}:{actor}:{group_id or 'private'}"
+        event_id, notice_type, sub_type, ts_i = self._build_notice_event_id(
+            payload=payload,
+            actor_id=actor,
+            group_id=group_id,
+        )
 
-        # 入库一条 context record：让 poke 成为“可见上下文事件”
-        poke_text = "(poke)"
-        self._store.append_message(
-            session_key,
-            ContextMessageRecord(
-                sender_name=str(sender_name),
-                sender_id=str(actor),
-                message_id=event_id,
-                text=poke_text,
-                chat_type=chat.chat_type,
-                group_id=str(group_id or ""),
-                is_bot=False,
-            ),
+        self._cache_notice_record(
+            session_key=session_key,
+            chat=chat,
+            actor_id=actor,
+            sender_name=sender_name,
+            event_id=event_id,
         )
 
         self._log_notice_decision(decision)
@@ -3031,6 +3013,61 @@ class NapCatWSChannel(BaseChannel):
             decision=decision,
         )
         return
+
+    def _build_notice_chat(self, *, actor_id: str, group_id: str) -> ChatRef:
+        """根据 notice 发起者与群号构造 chat 引用。"""
+
+        return ChatRef(
+            chat_type="group" if group_id else "private",
+            chat_id=str(group_id or actor_id),
+            user_id=str(actor_id),
+            group_id=str(group_id or ""),
+        )
+
+    def _build_notice_event_id(
+        self,
+        *,
+        payload: dict[str, Any],
+        actor_id: str,
+        group_id: str,
+    ) -> tuple[str, str, str, int]:
+        """生成 notice 事件 id，并返回 notice 基本元信息。"""
+
+        notice_type = str(payload.get("notice_type") or "notice").strip() or "notice"
+        sub_type = str(payload.get("sub_type") or payload.get("notify_type") or "").strip() or ""
+        ts_raw = payload.get("time")
+        try:
+            ts_i = int(ts_raw) if ts_raw is not None else int(time.time())
+        except Exception:
+            ts_i = int(time.time())
+        event_id = (
+            f"notice:{notice_type}:{sub_type}:{ts_i}:{actor_id}:{group_id or 'private'}"
+        )
+        return event_id, notice_type, sub_type, ts_i
+
+    def _cache_notice_record(
+        self,
+        *,
+        session_key: str,
+        chat: ChatRef,
+        actor_id: str,
+        sender_name: str,
+        event_id: str,
+    ) -> None:
+        """把 notice 事件写入上下文缓存。"""
+
+        self._store.append_message(
+            session_key,
+            ContextMessageRecord(
+                sender_name=str(sender_name),
+                sender_id=str(actor_id),
+                message_id=event_id,
+                text="(poke)",
+                chat_type=chat.chat_type,
+                group_id=str(chat.group_id or ""),
+                is_bot=False,
+            ),
+        )
 
     async def _publish_notice_inbound(
         self,
@@ -3489,7 +3526,6 @@ class NapCatWSChannel(BaseChannel):
 
         self._log_inbound(msg)
         self._log_message_decision(decision)
-
         if not decision.should_reply:
             return
 
