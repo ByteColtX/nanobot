@@ -2987,38 +2987,143 @@ class NapCatWSChannel(BaseChannel):
 
             params = _parse_cq_params(params_raw)
             file_val = str(params.get("file") or "").strip()
-
-            # 已经是 URI（或 base64）则不动
-            lower = file_val.lower()
-            if (
-                not file_val
-                or lower.startswith("file://")
-                or lower.startswith("http://")
-                or lower.startswith("https://")
-                or lower.startswith("base64://")
-            ):
+            if not file_val or self._is_cq_file_uri(file_val):
                 out.append(cq_text)
                 pos = m.end()
                 continue
 
-            p = Path(os.path.expanduser(file_val))
-            if not p.is_absolute():
-                p = self._media_dir / file_val
-
-            try:
-                if p.exists() and p.is_file():
-                    params["file"] = f"file://{p.resolve()}"
-                    params_str = ",".join(f"{k}={v}" for k, v in params.items() if k)
-                    out.append(f"[CQ:image,{params_str}]")
-                else:
-                    out.append(cq_text)
-            except Exception:
+            resolved = self._resolve_outbound_image_file(file_val)
+            if resolved is None:
                 out.append(cq_text)
+                pos = m.end()
+                continue
 
+            params["file"] = f"file://{resolved}"
+            params_str = ",".join(f"{key}={value}" for key, value in params.items() if key)
+            out.append(f"[CQ:image,{params_str}]")
             pos = m.end()
 
         out.append(s[pos:])
         return "".join(out)
+
+    @staticmethod
+    def _is_cq_file_uri(file_value: str) -> bool:
+        """判断 CQ image 的 file 参数是否已经是 URI/base64。"""
+
+        lower = str(file_value or "").strip().lower()
+        return lower.startswith(("file://", "http://", "https://", "base64://"))
+
+    def _resolve_outbound_image_file(self, file_value: str) -> Path | None:
+        """把 CQ image 的 file 参数解析成本地文件路径。"""
+
+        path = Path(os.path.expanduser(str(file_value or "").strip()))
+        if not path.is_absolute():
+            path = self._media_dir / str(file_value or "").strip()
+        try:
+            return path.resolve() if path.exists() and path.is_file() else None
+        except Exception:
+            return None
+
+    def _prepare_outbound_content(self, msg: OutboundMessage) -> tuple[str, CQValidationResult] | None:
+        """预处理出站文本并执行轻校验。"""
+
+        content = self._normalize_outbound_cq_images(str(msg.content or ""))
+        if not content.strip() and not msg.media:
+            return None
+        validation = validate_outbound_cq_text(content)
+        if validation.valid:
+            content = validation.normalized_text
+        return content, validation
+
+    def _warn_invalid_outbound_cq(
+        self,
+        *,
+        msg: OutboundMessage,
+        validation: CQValidationResult,
+    ) -> None:
+        """记录出站 CQ 校验告警。"""
+
+        detail = "; ".join(f"{issue.code}:{issue.message}" for issue in validation.issues[:5])
+        chat_type = str(msg.metadata.get("chat_type") or "")
+        group_id = msg.metadata.get("group_id") or msg.chat_id
+        user_id = msg.metadata.get("user_id") or msg.chat_id
+        target = group_id if chat_type == "group" else user_id
+        logger.warning(
+            "napcat_ws outbound invalid_cq allow_anyway detail={} chat_type={} target={}",
+            detail,
+            chat_type,
+            target,
+        )
+
+    @staticmethod
+    def _build_send_action(msg: OutboundMessage) -> str:
+        """根据出站消息推导 NapCat action。"""
+
+        return "send_group_msg" if msg.metadata.get("chat_type") == "group" else "send_private_msg"
+
+    @staticmethod
+    def _normalize_send_target(value: Any) -> Any:
+        """规范化 send action 的目标 id。"""
+
+        text = str(value or "")
+        return int(text) if text.isdigit() else value
+
+    def _build_send_params(self, *, action: str, msg: OutboundMessage, content: str) -> dict[str, Any]:
+        """构造 send action 参数。"""
+
+        params: dict[str, Any] = {"message": content}
+        if action == "send_group_msg":
+            params["group_id"] = self._normalize_send_target(
+                msg.metadata.get("group_id") or msg.chat_id
+            )
+        else:
+            params["user_id"] = self._normalize_send_target(
+                msg.metadata.get("user_id") or msg.chat_id
+            )
+        return params
+
+    async def _cache_outbound_bot_message(
+        self,
+        *,
+        msg: OutboundMessage,
+        message_id: str,
+        content: str,
+    ) -> None:
+        """将 bot 出站消息写入 session buffer（用于后续 reply_to_bot 判断与上下文）。"""
+
+        session_key = msg.metadata.get("session_key")
+        if not session_key:
+            return
+
+        sender_name = None
+        try:
+            if msg.metadata.get("chat_type") == "group":
+                gid = str(msg.metadata.get("group_id") or msg.chat_id or "").strip()
+                sender_name = await self._get_bot_display_name_for_group(gid)
+        except Exception:
+            sender_name = None
+
+        if not sender_name:
+            sender_name = (
+                str(getattr(self.config, "self_nickname", "") or "").strip()
+                or self._self_account_nickname
+                or str(self._self_id or "").strip()
+                or "bot"
+            )
+
+        self._store.remember_bot_message_id(session_key, str(message_id))
+        self._store.append_message(
+            session_key,
+            ContextMessageRecord(
+                sender_name=str(sender_name),
+                sender_id=str(self._self_id or ""),
+                message_id=str(message_id),
+                text=str(content),
+                chat_type=str(msg.metadata.get("chat_type") or "group"),
+                group_id=str(msg.metadata.get("group_id") or ""),
+                is_bot=True,
+            ),
+        )
 
     async def send(self, msg: OutboundMessage) -> None:
         """从 MessageBus 收到 OutboundMessage 后，发送到平台。
@@ -3033,42 +3138,16 @@ class NapCatWSChannel(BaseChannel):
         if not msg or not isinstance(msg, OutboundMessage):
             return
 
-        content = str(msg.content or "")
-        content = self._normalize_outbound_cq_images(content)
-
-        if not content.strip() and not msg.media:
+        prepared = self._prepare_outbound_content(msg)
+        if prepared is None:
             return
+        content, validation = prepared
 
-        validation = validate_outbound_cq_text(content)
         if not validation.valid:
-            # 放宽：CQ 码校验失败也允许出站。
-            # 原因：不同 OneBot/NapCat 版本对 CQ 参数要求可能不同（例如 image.file 是否必须是 file:// URI）。
-            # 这里仅记录告警，避免因为本地校验过严导致消息被直接丢弃。
-            detail = "; ".join(f"{x.code}:{x.message}" for x in validation.issues[:5])
-            chat_type = str(msg.metadata.get("chat_type") or "")
-            gid = msg.metadata.get("group_id") or msg.chat_id
-            uid = msg.metadata.get("user_id") or msg.chat_id
-            target = gid if chat_type == "group" else uid
-            logger.warning(
-                "napcat_ws outbound invalid_cq allow_anyway detail={} chat_type={} target={}",
-                detail,
-                chat_type,
-                target,
-            )
-        else:
-            content = validation.normalized_text
+            self._warn_invalid_outbound_cq(msg=msg, validation=validation)
 
-        action = (
-            "send_group_msg" if msg.metadata.get("chat_type") == "group" else "send_private_msg"
-        )
-
-        params: dict[str, Any] = {"message": content}
-        if action == "send_group_msg":
-            gid = msg.metadata.get("group_id") or msg.chat_id
-            params["group_id"] = int(gid) if str(gid).isdigit() else gid
-        else:
-            uid = msg.metadata.get("user_id") or msg.chat_id
-            params["user_id"] = int(uid) if str(uid).isdigit() else uid
+        action = self._build_send_action(msg)
+        params = self._build_send_params(action=action, msg=msg, content=content)
 
         try:
             resp = await self._transport.call_action(action, params=params, timeout=10.0)
@@ -3093,36 +3172,11 @@ class NapCatWSChannel(BaseChannel):
                 if isinstance(data, dict):
                     mid = data.get("message_id") or data.get("messageId")
                 if mid is not None:
-                    session_key = msg.metadata.get("session_key")
-                    if session_key:
-                        sender_name = None
-                        try:
-                            if msg.metadata.get("chat_type") == "group":
-                                gid = str(msg.metadata.get("group_id") or msg.chat_id or "").strip()
-                                sender_name = await self._get_bot_display_name_for_group(gid)
-                        except Exception:
-                            sender_name = None
-                        if not sender_name:
-                            sender_name = (
-                                str(getattr(self.config, "self_nickname", "") or "").strip()
-                                or self._self_account_nickname
-                                or str(self._self_id or "").strip()
-                                or "bot"
-                            )
-
-                        self._store.remember_bot_message_id(session_key, str(mid))
-                        self._store.append_message(
-                            session_key,
-                            ContextMessageRecord(
-                                sender_name=str(sender_name),
-                                sender_id=str(self._self_id or ""),
-                                message_id=str(mid),
-                                text=str(content),
-                                chat_type=str(msg.metadata.get("chat_type") or "group"),
-                                group_id=str(msg.metadata.get("group_id") or ""),
-                                is_bot=True,
-                            ),
-                        )
+                    await self._cache_outbound_bot_message(
+                        msg=msg,
+                        message_id=str(mid),
+                        content=str(content),
+                    )
         except Exception:
             pass
 
