@@ -812,6 +812,24 @@ class NapCatContextBuilder:
     def _build_group(
         self, *, chat: ChatRef, bot_name: str, bot_id: str, messages: list[ContextMessageRecord]
     ) -> str:
+        """构建群聊 CQCTX 文本。
+
+        输出形态：
+            - Header: `<CQCTX/3 g:{group_id} bot:{bot_ref} n:{N}>`
+            - User rows: `U|{ref}|{qq}|{name}[|bot]`
+            - Image rows: `I|{ref}|{filename}`
+            - Body: 由 `_serialize_messages()` 输出
+            - Footer: `</CQCTX/3>`
+
+        Args:
+            chat: 聊天引用（chat_type 必须为 group）。
+            bot_name: bot 展示名。
+            bot_id: bot QQ。
+            messages: 上下文消息。
+
+        Returns:
+            CQCTX 文本（多行，以 `\n` 拼接）。
+        """
         symbols = self._collect_symbols(
             chat=chat, bot_name=bot_name, bot_id=bot_id, messages=messages
         )
@@ -846,6 +864,27 @@ class NapCatContextBuilder:
     def _build_dm(
         self, *, chat: ChatRef, bot_name: str, bot_id: str, messages: list[ContextMessageRecord]
     ) -> str:
+        """构建私聊 CQDM 文本。
+
+        输出形态：
+            - Header: `<CQDM/1 n:{N}>`
+            - Participants:
+              - `P|me|{bot_id}|{bot_name}|bot`
+              - `P|peer|{peer_id}|{peer_name}`
+            - Extra users: `U|{ref}|{qq}|{name}[|bot]`
+            - Images: `I|{ref}|{filename}`
+            - Body: 由 `_serialize_messages()` 输出
+            - Footer: `</CQDM/1>`
+
+        Args:
+            chat: 聊天引用（chat_type 必须为 private）。
+            bot_name: bot 展示名。
+            bot_id: bot QQ。
+            messages: 上下文消息。
+
+        Returns:
+            CQDM 文本（多行，以 `\n` 拼接）。
+        """
         symbols = self._collect_symbols(
             chat=chat, bot_name=bot_name, bot_id=bot_id, messages=messages
         )
