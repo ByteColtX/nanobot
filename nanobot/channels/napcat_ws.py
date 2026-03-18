@@ -1474,6 +1474,46 @@ class NapCatMessageDetailFetcher:
             media_meta=list(item.media_meta or []),
         )
 
+    async def _download_detail_images(
+        self,
+        *,
+        message: Any,
+        media_meta: list[dict[str, Any]],
+    ) -> list[str]:
+        """下载详情消息里的图片，优先使用原始 segments，必要时回退到 media_meta。"""
+
+        if isinstance(message, list):
+            return await self._download_images_from_message(message)
+        fake_message = self._build_fake_image_message(list(media_meta or []))
+        if not fake_message:
+            return []
+        return await self._download_images_from_message(fake_message)
+
+    async def _download_expanded_reply_images(self, exp: ExpandedReply) -> list[str]:
+        """下载 reply 展开结果里的可见图片。"""
+
+        return await self._download_detail_images(
+            message=getattr(exp, "message", None),
+            media_meta=list(getattr(exp, "media_meta", None) or []),
+        )
+
+    async def _download_expanded_forward_images(self, exp: ExpandedForward) -> list[str]:
+        """下载 forward 展开结果里的可见图片。"""
+
+        return await self._download_detail_images(
+            message=None,
+            media_meta=list(getattr(exp, "media_meta", None) or []),
+        )
+
+    def _merge_media_paths(self, base_paths: list[str], extra_paths: list[str]) -> list[str]:
+        """合并媒体路径并保持顺序去重。"""
+
+        merged: list[str] = []
+        for path in list(base_paths or []) + list(extra_paths or []):
+            if isinstance(path, str) and path and path not in merged:
+                merged.append(path)
+        return merged
+
     @staticmethod
     def _build_fake_image_message(media_meta: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """把图片 media_meta 转成最小 image segments，供统一下载器复用。"""
@@ -3733,16 +3773,7 @@ class NapCatWSChannel(BaseChannel):
         # 关键修复：引用消息里的图片也要下载到本地并传给大模型。
         # 不做 fallback：优先用 exp.message（segments），如果 message 不是数组，则用 media_meta 构造最小 segments 下载。
         try:
-            paths: list[str] = []
-            if isinstance(getattr(exp, "message", None), list):
-                paths = await self._download_images_from_message(getattr(exp, "message"))
-            else:
-                fake_message = self._build_fake_image_message(
-                    list(getattr(exp, "media_meta", None) or [])
-                )
-                if fake_message:
-                    paths = await self._download_images_from_message(fake_message)
-            msg.reply.media_paths = paths
+            msg.reply.media_paths = await self._download_expanded_reply_images(exp)
         except Exception:
             msg.reply.media_paths = []
 
@@ -3757,10 +3788,14 @@ class NapCatWSChannel(BaseChannel):
             try:
                 fitems = await self._fetch_forward_items(msg.reply.forward_id, msg.chat)
                 msg.reply.forward_items = fitems or msg.reply.forward_items
-                for item in msg.reply.forward_items or []:
-                    for path in item.media_paths or []:
-                        if isinstance(path, str) and path and path not in msg.reply.media_paths:
-                            msg.reply.media_paths.append(path)
+                msg.reply.media_paths = self._merge_media_paths(
+                    msg.reply.media_paths,
+                    [
+                        path
+                        for item in (msg.reply.forward_items or [])
+                        for path in list(item.media_paths or [])
+                    ],
+                )
             except Exception:
                 pass
 
@@ -3790,18 +3825,10 @@ class NapCatWSChannel(BaseChannel):
         if fexp is None or not getattr(fexp, "items", None):
             return []
 
-        # 关键修复：合并转发节点里的图片也要下载到本地，让大模型可见。
-        # NapCat get_forward_msg 返回的节点消息在 expand_forward 中已被 消息解析器解析，
-        # 这里复用其 media_meta（只包含 https 图片 url + file/name）。
-        forward_media_meta = list(getattr(fexp, "media_meta", None) or [])
-        if forward_media_meta:
-            try:
-                fake_message = self._build_fake_image_message(forward_media_meta)
-                forward_paths = await self._download_images_from_message(fake_message)
-            except Exception as exc:
-                logger.debug("napcat_ws forward_image_download_failed err={}", exc)
-                forward_paths = []
-        else:
+        try:
+            forward_paths = await self._download_expanded_forward_images(fexp)
+        except Exception as exc:
+            logger.debug("napcat_ws forward_image_download_failed err={}", exc)
             forward_paths = []
 
         return [
