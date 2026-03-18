@@ -2419,17 +2419,13 @@ class NapCatTransport:
         }
 
     async def _connect_ws(self) -> tuple[str, ClientConnection]:
-        """建立 websocket 连接，并兼容旧版 websockets 参数名。"""
+        """建立 websocket 连接。"""
 
         url = self._normalize_ws_url(self.config.url)
-        headers = self._build_connect_headers(self.config.token)
-        connect_kwargs = self._build_connect_kwargs(headers)
-        try:
-            ws = await websockets.connect(url, **connect_kwargs)
-        except TypeError:
-            connect_kwargs.pop("additional_headers", None)
-            connect_kwargs["extra_headers"] = headers
-            ws = await websockets.connect(url, **connect_kwargs)
+        connect_kwargs = self._build_connect_kwargs(
+            self._build_connect_headers(self.config.token)
+        )
+        ws = await websockets.connect(url, **connect_kwargs)
         return url, ws
 
     async def _cleanup_connection(self, ws: ClientConnection | None) -> None:
