@@ -4299,7 +4299,3 @@ class NapCatWSChannel(BaseChannel):
             payload.get("sub_type") or payload.get("notify_type") or "",
             payload.get("message_type") or "",
         )
-
-
-# 向后兼容导出（如果旧代码用 from ... import NapCatWSChannel）
-__all__ = ["NapCatWSChannel"]
