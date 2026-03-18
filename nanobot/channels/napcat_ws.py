@@ -2362,27 +2362,6 @@ def _parse_cq_params(params_raw: str) -> dict[str, str]:
     return params
 
 
-def _file_uri_to_local_path(file_uri: str) -> str | None:
-    """把 `file://` URI 转换为本地文件路径。
-
-    Args:
-        file_uri: 形如 `file:///abs/path/to/a.png` 的 URI。
-
-    Returns:
-        对应的本地路径字符串；若不是 file URI 或无法解析则返回 None。
-    """
-    raw = str(file_uri or "").strip()
-    if not raw:
-        return None
-    if not raw.startswith("file://"):
-        return None
-    parsed = urlparse(raw)
-    if parsed.scheme != "file":
-        return None
-    path = os.path.abspath(os.path.expanduser(parsed.path or ""))
-    return path or None
-
-
 def validate_outbound_cq_text(content: str) -> CQValidationResult:
     """轻校验模型生成的 CQ 出站文本（仅用于告警，不拦截）。
 
@@ -3939,18 +3918,6 @@ class NapCatWSChannel(BaseChannel):
 
         msg.forward_items = items
         msg.forward_summary = self._build_forward_summary(items)
-
-    def _pick_sender_name(self, sender: dict[str, Any], *, fallback: str) -> str:
-        card = str(sender.get("card") or "").strip()
-        if card:
-            return card
-
-        nickname = str(sender.get("nickname") or "").strip()
-        if nickname:
-            return nickname
-
-        return fallback or "unknown"
-
     def _parse_payload_message(self, *, message: Any, raw: Any = None) -> ParsedMessage:
         """把 message/raw_message 解析为 `ParsedMessage`。
 
