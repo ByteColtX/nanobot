@@ -1471,6 +1471,14 @@ class SessionBufferStore:
         self._sessions: dict[str, SessionBufferState] = {}
 
     def get_or_create(self, session_key: str) -> SessionBufferState:
+        """获取或创建 session 状态。
+
+        Args:
+            session_key: 会话 key（见 `make_session_key`）。
+
+        Returns:
+            对应的 `SessionBufferState`。
+        """
         if session_key not in self._sessions:
             self._sessions[session_key] = SessionBufferState(
                 messages=deque(maxlen=self._buffer_size),
@@ -1479,21 +1487,53 @@ class SessionBufferStore:
         return self._sessions[session_key]
 
     def append_message(self, session_key: str, line: ContextMessageLine) -> None:
+        """向指定 session 追加一条上下文消息。
+
+        Args:
+            session_key: 会话 key。
+            line: 消息行。
+        """
         self.get_or_create(session_key).messages.append(line)
 
     def recent_messages(self, session_key: str, limit: int) -> list[ContextMessageLine]:
+        """获取指定 session 的最近 N 条消息。
+
+        Args:
+            session_key: 会话 key。
+            limit: 返回条数上限；<=0 返回空列表。
+
+        Returns:
+            最近的消息行列表（按原始顺序）。
+        """
         if limit <= 0:
             return []
         state = self.get_or_create(session_key)
         return list(state.messages)[-int(limit) :]
 
     def remember_bot_message_id(self, session_key: str, message_id: str) -> None:
+        """记录机器人发出的 message_id。
+
+        用于后续的 reply_to_bot 触发判断（兜底：引用 bot 的历史 message_id）。
+
+        Args:
+            session_key: 会话 key。
+            message_id: message_id。
+        """
         mid = str(message_id or "").strip()
         if not mid:
             return
         self.get_or_create(session_key).bot_message_ids.append(mid)
 
     def is_bot_message_id(self, session_key: str, message_id: str) -> bool:
+        """判断 message_id 是否属于机器人在该 session 内发出的消息。
+
+        Args:
+            session_key: 会话 key。
+            message_id: 待判断的 message_id。
+
+        Returns:
+            若命中已记录集合则返回 True。
+        """
         mid = str(message_id or "").strip()
         if not mid:
             return False
