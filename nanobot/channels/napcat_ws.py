@@ -27,7 +27,7 @@
 - 改触发规则，优先看 Policy。
 - 改上下文构建，优先看 Session / Context。
 - 改发送行为，优先看 Outbound。
-- 新逻辑优先接当前主链路，不要把 legacy 实现带回。
+- 新逻辑优先接当前主链路，避免把旧实现带回。
 """
 
 from __future__ import annotations
@@ -2706,7 +2706,7 @@ class NapCatTransport:
 
         async with self._lock:
             self._echo_counter += 1
-            # Match legacy echo style: prefix + ms timestamp for better uniqueness/compat.
+            # 保持兼容旧 echo 形态：prefix + ms timestamp + counter。
             echo = f"nanobot:{action}:{int(datetime.now().timestamp() * 1000)}:{self._echo_counter}"
 
         loop = asyncio.get_running_loop()
@@ -2799,13 +2799,13 @@ class NapCatWSChannel(BaseChannel):
         return datetime.now().timestamp()
 
     def _truncate_user_text(self, s: str) -> str:
-        """Truncate a single user message to keep context readable.
+        """截断单条用户消息，避免上下文过长。
 
-        Rule (per config.context_message_max_chars):
-        - limit <= 0: no truncation
-        - len(text) > limit: text[:limit] + TRUNCATION_TAG
+        规则（由 config.context_message_max_chars 控制）：
+        - limit <= 0：不截断
+        - len(text) > limit：返回 `text[:limit] + TRUNCATION_TAG`
 
-        NOTE: This is for context/input shaping only (not for outbound bot replies).
+        注意：该截断仅用于上下文/输入整形，不用于 bot 出站回复。
         """
 
         limit = int(getattr(self.config, "context_message_max_chars", 0) or 0)
