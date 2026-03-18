@@ -448,7 +448,7 @@ class ExpandedForward:
     """合并转发（forward）的展开结果。"""
 
     id: str
-    items: list[dict[str, Any]] = field(default_factory=list)
+    items: list[ForwardItemRecord] = field(default_factory=list)
     media_meta: list[dict[str, Any]] = field(default_factory=list)
     summary: str = ""
 
@@ -468,9 +468,9 @@ class ExpandedReply:
     """
 
     id: str
-    u: str = ""
-    q: str = ""
-    m: str = ""
+    sender_name: str = ""
+    sender_id: str = ""
+    text: str = ""
     forward: Optional[ExpandedForward] = None
 
     # 原始消息体（尽量保留 message segments，便于下载引用消息里的图片）
@@ -1424,6 +1424,37 @@ class NapCatMessageDetailFetcher:
         self._transport = transport
         self._parser = parser
 
+    def _parse_detail_message(self, *, message: Any, raw_message: Any) -> ParsedMessage:
+        """解析 get_msg / get_forward_msg 返回的消息体。"""
+
+        payload_like = {
+            "message": message,
+            "raw_message": raw_message,
+            "message_format": "array" if isinstance(message, list) else "string",
+        }
+        return self._parser.parse(payload=payload_like, self_id="")
+
+    def _truncate_detail_text(self, text: str) -> str:
+        """按 context_message_max_chars 截断详情文本。"""
+
+        value = str(text or "")
+        try:
+            limit = int(getattr(self._transport.config, "context_message_max_chars", 0) or 0)
+        except Exception:
+            limit = 0
+        if limit > 0 and len(value) > limit:
+            return value[:limit] + TRUNCATION_TAG
+        return value
+
+    @staticmethod
+    def _build_forward_source(*, chat: ChatRef, group_id: Any) -> str:
+        """构造 forward 节点来源标记。"""
+
+        if chat.chat_type != "private":
+            return ""
+        gid = str(group_id or "").strip()
+        return f"g:{gid}" if gid else ""
+
     async def expand_reply(self, *, message_id: str, chat: ChatRef) -> ExpandedReply:
         """展开引用消息（reply）。
 
@@ -1457,13 +1488,11 @@ class NapCatMessageDetailFetcher:
         uid = str(sender.get("user_id") or data.get("user_id") or "").strip()
         u = str(sender.get("card") or sender.get("nickname") or uid or "unknown").strip()
 
-        payload_like = {
-            "message": data.get("message"),
-            "raw_message": data.get("raw_message"),
-            "message_format": "array" if isinstance(data.get("message"), list) else "string",
-        }
-        parsed = self._parser.parse(payload=payload_like, self_id="")
-        m = parsed.cq_text or str(data.get("raw_message") or "").strip()
+        parsed = self._parse_detail_message(
+            message=data.get("message"),
+            raw_message=data.get("raw_message"),
+        )
+        text = parsed.cq_text or str(data.get("raw_message") or "").strip()
 
         # 额外：保留引用消息的原始 segments + 结构化 media_meta（便于下载引用消息图片）
         media_meta = list(getattr(parsed, "media_meta", None) or [])
@@ -1475,9 +1504,9 @@ class NapCatMessageDetailFetcher:
 
         return ExpandedReply(
             id=mid,
-            u=u,
-            q=uid,
-            m=m,
+            sender_name=u,
+            sender_id=uid,
+            text=text,
             forward=fw,
             message=data.get("message"),
             raw_message=data.get("raw_message"),
@@ -1514,24 +1543,20 @@ class NapCatMessageDetailFetcher:
         if not isinstance(nodes, list):
             return ExpandedForward(id=fid)
 
-        items: list[dict[str, Any]] = []
+        items: list[ForwardItemRecord] = []
         media_meta: list[dict[str, Any]] = []
         for node in nodes:
             if isinstance(node, str):
-                payload_like = {"message": node, "raw_message": node, "message_format": "string"}
-                parsed = self._parser.parse(payload=payload_like, self_id="")
-                m_raw = parsed.cq_text or str(node)
-                m = m_raw
-                if getattr(self._transport, "config", None) is not None:
-                    try:
-                        limit = int(
-                            getattr(self._transport.config, "context_message_max_chars", 0) or 0
-                        )
-                    except Exception:
-                        limit = 0
-                    if limit > 0 and len(m) > limit:
-                        m = m[:limit] + TRUNCATION_TAG
-                items.append({"u": "unknown", "q": "", "id": "", "m": m, "src": ""})
+                parsed = self._parse_detail_message(message=node, raw_message=node)
+                text = self._truncate_detail_text(parsed.cq_text or str(node))
+                items.append(
+                    ForwardItemRecord(
+                        sender_name="unknown",
+                        sender_id="",
+                        message_id="",
+                        text=text,
+                    )
+                )
                 if parsed.media_meta:
                     media_meta.extend(list(parsed.media_meta))
                 continue
@@ -1544,34 +1569,21 @@ class NapCatMessageDetailFetcher:
                 sender = {}
             uid = str(node.get("user_id") or sender.get("user_id") or "").strip()
             u = str(sender.get("card") or sender.get("nickname") or uid or "unknown").strip()
-            src = ""
-            if chat.chat_type == "private":
-                gid = str(node.get("group_id") or "").strip()
-                if gid:
-                    src = f"g:{gid}"
-
-            payload_like = {
-                "message": node.get("message"),
-                "raw_message": node.get("raw_message"),
-                "message_format": "array" if isinstance(node.get("message"), list) else "string",
-            }
-            parsed = self._parser.parse(payload=payload_like, self_id="")
-            m_raw = parsed.cq_text or str(node.get("raw_message") or "").strip()
-            m = m_raw
-            try:
-                limit = int(getattr(self._transport.config, "context_message_max_chars", 0) or 0)
-            except Exception:
-                limit = 0
-            if limit > 0 and len(m) > limit:
-                m = m[:limit] + TRUNCATION_TAG
+            parsed = self._parse_detail_message(
+                message=node.get("message"),
+                raw_message=node.get("raw_message"),
+            )
+            text = self._truncate_detail_text(
+                parsed.cq_text or str(node.get("raw_message") or "").strip()
+            )
             items.append(
-                {
-                    "u": u,
-                    "q": uid,
-                    "id": str(node.get("message_id") or "").strip(),
-                    "m": m,
-                    "src": src,
-                }
+                ForwardItemRecord(
+                    sender_name=u,
+                    sender_id=uid,
+                    message_id=str(node.get("message_id") or "").strip(),
+                    text=text,
+                    source=self._build_forward_source(chat=chat, group_id=node.get("group_id")),
+                )
             )
             if parsed.media_meta:
                 media_meta.extend(list(parsed.media_meta))
@@ -3657,9 +3669,9 @@ class NapCatWSChannel(BaseChannel):
         if exp is None:
             return
 
-        msg.reply.sender_id = str(exp.q or "")
-        msg.reply.sender_name = str(exp.u or exp.q or "unknown")
-        msg.reply.text = str(exp.m or "")
+        msg.reply.sender_id = str(exp.sender_id or "")
+        msg.reply.sender_name = str(exp.sender_name or exp.sender_id or "unknown")
+        msg.reply.text = str(exp.text or "")
         msg.reply.media = []
 
         # 关键修复：引用消息里的图片也要下载到本地并传给大模型。
@@ -3687,7 +3699,22 @@ class NapCatWSChannel(BaseChannel):
         except Exception:
             msg.reply.media_paths = []
 
-        msg.reply.forward_items = list(getattr(getattr(exp, "forward", None), "items", None) or [])
+        msg.reply.forward_items = [
+            {
+                "sender_id": str(item.sender_id or ""),
+                "sender_name": str(item.sender_name or item.sender_id or "unknown"),
+                "message_id": str(item.message_id or "").strip(),
+                "time": None,
+                "text": str(item.text or ""),
+                "media": [],
+                "media_paths": [],
+                "media_meta": list(item.media_meta or []),
+                "message": None,
+                "raw_message": None,
+                "src": str(item.source or "").strip(),
+            }
+            for item in list(getattr(getattr(exp, "forward", None), "items", None) or [])
+        ]
         msg.reply.forward_id = str(getattr(exp, "id", "") or rid)
 
         # 如果引用消息本身是合并转发：也把转发里的图片下载并挂到 reply.media_paths
@@ -3758,21 +3785,19 @@ class NapCatWSChannel(BaseChannel):
 
         items: list[dict[str, Any]] = []
         for item in fexp.items:
-            if not isinstance(item, dict):
-                continue
             items.append(
                 {
-                    "sender_id": str(item.get("q") or ""),
-                    "sender_name": str(item.get("u") or item.get("q") or "unknown"),
-                    "message_id": str(item.get("id") or "").strip(),
+                    "sender_id": str(item.sender_id or ""),
+                    "sender_name": str(item.sender_name or item.sender_id or "unknown"),
+                    "message_id": str(item.message_id or "").strip(),
                     "time": None,
-                    "text": str(item.get("m") or ""),
+                    "text": str(item.text or ""),
                     "media": [],
                     "media_paths": list(forward_paths),
-                    "media_meta": [],
+                    "media_meta": list(item.media_meta or []),
                     "message": None,
                     "raw_message": None,
-                    "src": str(item.get("src") or "").strip(),
+                    "src": str(item.source or "").strip(),
                 }
             )
         return items
