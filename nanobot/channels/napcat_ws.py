@@ -1000,62 +1000,127 @@ class NapCatContextBuilder:
             行列表（不包含外层 `<CQCTX/...>` 包裹）。
         """
         rows: list[str] = []
+        peer_id = str(chat.user_id or chat.chat_id or "")
         for line in messages:
             sender_ref = self._sender_ref(
                 line=line,
                 symbols=symbols,
                 private_mode=private_mode,
                 bot_id=bot_id,
-                peer_id=str(chat.user_id or chat.chat_id or ""),
+                peer_id=peer_id,
             )
             body = encoder.encode(line.text)
-            forward_rows: list[str] = []
-            if line.forward_items:
-                fid = symbols.new_forward_ref()
-                if body:
-                    body = f"{body} [F:{fid}]".strip()
-                else:
-                    body = f"[F:{fid}]"
-
-                summary = ""
-                if isinstance(line.reply, ReplyRecord):
-                    summary = str(line.reply.forward_summary or "").strip()
-                if not summary:
-                    summary = str(getattr(line, "forward_summary", "") or "").strip()
-                summary_part = f"|{_cqctx_escape(summary)}" if summary else ""
-
-                forward_rows.append(f"F|{fid}|{len(line.forward_items)}{summary_part}")
-
-                node_ref_map: dict[str, str] = {}
-                for idx, node in enumerate(line.forward_items):
-                    if not isinstance(node, ForwardItemRecord):
-                        continue
-                    node_ref = f"{fid}.{idx}"
-                    node_msg_id = str(node.message_id or "").strip()
-                    if node_msg_id:
-                        node_ref_map[node_msg_id] = node_ref
-
-                for idx, node in enumerate(line.forward_items):
-                    if not isinstance(node, ForwardItemRecord):
-                        continue
-                    node_ref = f"{fid}.{idx}"
-                    node_sender = self._node_sender_ref(
-                        node=node,
-                        symbols=symbols,
-                        private_mode=private_mode,
-                        bot_id=bot_id,
-                        peer_id=str(chat.user_id or chat.chat_id or ""),
-                    )
-                    node_body = encoder.encode(str(node.text or ""), node_ref_map=node_ref_map)
-                    if private_mode:
-                        src = str(node.source or "").strip()
-                        src_part = f"|{_cqctx_escape(src)}" if src else ""
-                        forward_rows.append(f"N|{node_ref}|{node_sender}{src_part}|{node_body}")
-                    else:
-                        forward_rows.append(f"N|{node_ref}|{node_sender}|{node_body}")
+            body, forward_rows = self._serialize_forward_rows(
+                line=line,
+                body=body,
+                symbols=symbols,
+                encoder=encoder,
+                private_mode=private_mode,
+                bot_id=bot_id,
+                peer_id=peer_id,
+            )
             rows.append(f"M|{_cqctx_escape(line.message_id)}|{sender_ref}|{body}")
             rows.extend(forward_rows)
         return rows
+
+    def _resolve_forward_summary(self, line: ContextMessageRecord) -> str:
+        """提取一条消息对应的 forward summary。"""
+
+        if isinstance(line.reply, ReplyRecord):
+            summary = str(line.reply.forward_summary or "").strip()
+            if summary:
+                return summary
+        return str(getattr(line, "forward_summary", "") or "").strip()
+
+    def _build_forward_node_ref_map(
+        self, *, fid: str, forward_items: list[ForwardItemRecord]
+    ) -> dict[str, str]:
+        """构建 forward 节点 message_id 到节点引用的映射。"""
+
+        node_ref_map: dict[str, str] = {}
+        for idx, node in enumerate(forward_items):
+            if not isinstance(node, ForwardItemRecord):
+                continue
+            node_msg_id = str(node.message_id or "").strip()
+            if node_msg_id:
+                node_ref_map[node_msg_id] = f"{fid}.{idx}"
+        return node_ref_map
+
+    def _serialize_forward_node(
+        self,
+        *,
+        fid: str,
+        idx: int,
+        node: ForwardItemRecord,
+        node_ref_map: dict[str, str],
+        symbols: _CQCtxSymbolTable,
+        encoder: _CQCtxBodyEncoder,
+        private_mode: bool,
+        bot_id: str,
+        peer_id: str,
+    ) -> str:
+        """序列化单个 forward 节点。"""
+
+        node_ref = f"{fid}.{idx}"
+        node_sender = self._node_sender_ref(
+            node=node,
+            symbols=symbols,
+            private_mode=private_mode,
+            bot_id=bot_id,
+            peer_id=peer_id,
+        )
+        node_body = encoder.encode(str(node.text or ""), node_ref_map=node_ref_map)
+        if not private_mode:
+            return f"N|{node_ref}|{node_sender}|{node_body}"
+
+        src = str(node.source or "").strip()
+        src_part = f"|{_cqctx_escape(src)}" if src else ""
+        return f"N|{node_ref}|{node_sender}{src_part}|{node_body}"
+
+    def _serialize_forward_rows(
+        self,
+        *,
+        line: ContextMessageRecord,
+        body: str,
+        symbols: _CQCtxSymbolTable,
+        encoder: _CQCtxBodyEncoder,
+        private_mode: bool,
+        bot_id: str,
+        peer_id: str,
+    ) -> tuple[str, list[str]]:
+        """序列化一条消息携带的 forward 信息。"""
+
+        if not line.forward_items:
+            return body, []
+
+        fid = symbols.new_forward_ref()
+        body = f"{body} [F:{fid}]".strip() if body else f"[F:{fid}]"
+
+        summary = self._resolve_forward_summary(line)
+        summary_part = f"|{_cqctx_escape(summary)}" if summary else ""
+        rows = [f"F|{fid}|{len(line.forward_items)}{summary_part}"]
+
+        node_ref_map = self._build_forward_node_ref_map(
+            fid=fid,
+            forward_items=list(line.forward_items),
+        )
+        for idx, node in enumerate(line.forward_items):
+            if not isinstance(node, ForwardItemRecord):
+                continue
+            rows.append(
+                self._serialize_forward_node(
+                    fid=fid,
+                    idx=idx,
+                    node=node,
+                    node_ref_map=node_ref_map,
+                    symbols=symbols,
+                    encoder=encoder,
+                    private_mode=private_mode,
+                    bot_id=bot_id,
+                    peer_id=peer_id,
+                )
+            )
+        return body, rows
 
     def _sender_ref(
         self,
