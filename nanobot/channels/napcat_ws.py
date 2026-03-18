@@ -2402,34 +2402,10 @@ class NapCatTransport:
                 await asyncio.sleep(backoff_s)
                 backoff_s = min(backoff_s * 2.0, 30.0)
             finally:
-                # 取消并清理所有事件 tasks
-                for t in list(self._event_tasks):
-                    t.cancel()
-                self._event_tasks.clear()
-
-                # 取消登录拉取 task（避免跨连接悬挂）
-                if self._login_task is not None and not self._login_task.done():
-                    self._login_task.cancel()
-                self._login_task = None
-
-                # 连接断开：清理 pending futures，避免一直超时
-                for fut in list(self._pending.values()):
-                    if not fut.done():
-                        fut.set_exception(asyncio.CancelledError())
-                self._pending.clear()
-
-                try:
-                    if ws is not None:
-                        await ws.close()
-                except Exception:
-                    pass
-                self._ws = None
+                await self._cleanup_connection(ws)
 
         # stop() 退出后：兜底清 pending
-        for fut in list(self._pending.values()):
-            if not fut.done():
-                fut.set_exception(asyncio.CancelledError())
-        self._pending.clear()
+        self._fail_pending_futures()
 
     async def stop(self) -> None:
         """停止 transport 并清理 pending futures。"""
@@ -2439,27 +2415,53 @@ class NapCatTransport:
         self._running = False
 
         # 主动关闭 websocket（会让 start() 的 async for 退出）
-        try:
-            if self._ws is not None:
-                await self._ws.close()
-        except Exception:
-            pass
+        await self._close_ws(self._ws)
         self._ws = None
 
-        # 清理 event tasks
-        for t in list(self._event_tasks):
-            t.cancel()
+        self._cancel_event_tasks()
+        self._cancel_login_task()
+        self._fail_pending_futures()
+
+    async def _cleanup_connection(self, ws: ClientConnection | None) -> None:
+        """清理单次连接相关状态。"""
+
+        self._cancel_event_tasks()
+        self._cancel_login_task()
+        self._fail_pending_futures()
+        await self._close_ws(ws)
+        self._ws = None
+
+    def _cancel_event_tasks(self) -> None:
+        """取消并清空事件处理 tasks。"""
+
+        for task in list(self._event_tasks):
+            task.cancel()
         self._event_tasks.clear()
+
+    def _cancel_login_task(self) -> None:
+        """取消登录信息拉取 task。"""
 
         if self._login_task is not None and not self._login_task.done():
             self._login_task.cancel()
         self._login_task = None
 
-        # 清理 pending
+    def _fail_pending_futures(self) -> None:
+        """让所有待返回的 action future 以取消结束。"""
+
         for fut in list(self._pending.values()):
             if not fut.done():
                 fut.set_exception(asyncio.CancelledError())
         self._pending.clear()
+
+    @staticmethod
+    async def _close_ws(ws: ClientConnection | None) -> None:
+        """关闭 websocket 连接，忽略 close 阶段异常。"""
+
+        try:
+            if ws is not None:
+                await ws.close()
+        except Exception:
+            pass
 
     def _spawn_event_task(self, payload: dict[str, Any]) -> None:
         """以 task 方式执行 on_event，避免阻塞接收循环。"""
