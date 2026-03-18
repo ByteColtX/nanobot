@@ -2384,36 +2384,36 @@ def _file_uri_to_local_path(file_uri: str) -> str | None:
 
 
 def validate_outbound_cq_text(content: str) -> CQValidationResult:
-    """轻校验模型生成的 CQ 出站文本。
+    """轻校验模型生成的 CQ 出站文本（仅用于告警，不拦截）。
 
-    当前仅正式支持：
-      - [CQ:at,qq=...]
-      - [CQ:reply,id=...]
-      - [CQ:image,file=file:///...]
-
-    其它 CQ 先视为未支持，要求模型重写。
+    说明：
+        - 本函数永远返回 `valid=True`，不会阻止消息出站。
+        - `issues` 只用于日志告警，规则保持保守，避免误判。
     """
 
     text = str(content or "")
     issues: list[CQValidationIssue] = []
 
+    # 粗略检查：出现 [CQ: 但没有闭合 ]
+    if "[CQ:" in text and "]" not in text:
+        issues.append(CQValidationIssue("cq_not_closed", "疑似 CQ 未闭合", ""))
+
     for match in _CQ_OUTBOUND_RE.finditer(text):
         cq_text = match.group(0)
         cq_type = str(match.group(1) or "").strip().lower()
-        params = _parse_cq_params(match.group(2) or "")
+        params_raw = match.group(2) or ""
+        params = _parse_cq_params(params_raw)
+
+        if not cq_type:
+            issues.append(CQValidationIssue("invalid_cq", "CQ 类型为空", cq_text))
+            continue
 
         if cq_type == "at":
             qq = str(params.get("qq") or "").strip()
             if not qq:
-                issues.append(
-                    CQValidationIssue("missing_required_param", "at 缺少 qq 参数", cq_text)
-                )
-                continue
-            if qq != "all" and not qq.isdigit():
-                issues.append(
-                    CQValidationIssue("invalid_param_value", f"at.qq 非法: {qq}", cq_text)
-                )
-                continue
+                issues.append(CQValidationIssue("missing_required_param", "at 缺少 qq 参数", cq_text))
+            elif qq != "all" and not qq.isdigit():
+                issues.append(CQValidationIssue("invalid_param_value", f"at.qq 非法: {qq}", cq_text))
             continue
 
         if cq_type == "reply":
@@ -2422,45 +2422,20 @@ def validate_outbound_cq_text(content: str) -> CQValidationResult:
                 issues.append(
                     CQValidationIssue("missing_required_param", "reply 缺少 id 参数", cq_text)
                 )
-                continue
             continue
 
         if cq_type == "image":
-            file_uri = str(params.get("file") or "").strip()
-            if not file_uri:
+            file_val = str(params.get("file") or "").strip()
+            if not file_val:
                 issues.append(
                     CQValidationIssue("missing_required_param", "image 缺少 file 参数", cq_text)
                 )
-                continue
-            local_path = _file_uri_to_local_path(file_uri)
-            if not local_path:
-                issues.append(
-                    CQValidationIssue(
-                        "invalid_param_value", f"image.file 必须是 file:// URI: {file_uri}", cq_text
-                    )
-                )
-                continue
-            if not os.path.exists(local_path):
-                issues.append(
-                    CQValidationIssue(
-                        "image_file_not_found", f"image.file 不存在: {local_path}", cq_text
-                    )
-                )
-                continue
-            if not os.path.isfile(local_path):
-                issues.append(
-                    CQValidationIssue(
-                        "invalid_param_value", f"image.file 不是普通文件: {local_path}", cq_text
-                    )
-                )
-                continue
             continue
 
-        issues.append(
-            CQValidationIssue("unsupported_cq_type", f"暂不支持的 CQ 类型: {cq_type}", cq_text)
-        )
+        # 其它类型：只提示，不拦截
+        issues.append(CQValidationIssue("unsupported_cq_type", f"未显式支持的 CQ 类型: {cq_type}", cq_text))
 
-    return CQValidationResult(valid=not issues, normalized_text=text, issues=issues)
+    return CQValidationResult(valid=True, normalized_text=text, issues=issues)
 
 
 # ==============================
@@ -3143,7 +3118,7 @@ class NapCatWSChannel(BaseChannel):
             return
         content, validation = prepared
 
-        if not validation.valid:
+        if validation.issues:
             self._warn_invalid_outbound_cq(msg=msg, validation=validation)
 
         action = self._build_send_action(msg)
