@@ -213,8 +213,8 @@ CACHE_TTL_1D_SECONDS = 60 * 60 * 24
 DEFAULT_CACHE_TTL_SECONDS = CACHE_TTL_1D_SECONDS
 
 # message detail cache 上限
-V2_REPLY_CACHE_MAXSIZE = 2048
-V2_FORWARD_CACHE_MAXSIZE = 1024
+REPLY_CACHE_MAXSIZE = 2048
+FORWARD_CACHE_MAXSIZE = 1024
 
 
 TRUNCATION_TAG = "<TRUNCATED>"  # 固定截断标记
@@ -2494,8 +2494,8 @@ class NapCatWSChannel(BaseChannel):
         self._message_parser = NapCatMessageParser()
         self._message_cache = InMemoryMessageCache(
             ttl_seconds=DEFAULT_CACHE_TTL_SECONDS,
-            reply_maxsize=V2_REPLY_CACHE_MAXSIZE,
-            forward_maxsize=V2_FORWARD_CACHE_MAXSIZE,
+            reply_maxsize=REPLY_CACHE_MAXSIZE,
+            forward_maxsize=FORWARD_CACHE_MAXSIZE,
         )
         self._detail_fetcher = NapCatMessageDetailFetcher(
             transport=self._transport, parser=self._message_parser
