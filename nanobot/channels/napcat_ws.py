@@ -615,6 +615,16 @@ class _CQCtxBodyEncoder:
         self.is_group = bool(is_group)
 
     def encode(self, text: str, *, node_ref_map: Optional[dict[str, str]] = None) -> str:
+        """把渲染文本编码为 CQCtx body。
+
+        Args:
+            text: 输入文本，可能包含 CQ token（例如 `[CQ:at,qq=123]`）。
+            node_ref_map: 转发节点 message_id 到 node_ref 的映射；用于把 reply
+                映射成对转发节点的引用。
+
+        Returns:
+            CQCtx body 字符串。
+        """
         src = str(text or "")
         if not src:
             return ""
@@ -634,6 +644,16 @@ class _CQCtxBodyEncoder:
     def _map_token(
         self, typ: str, params: dict[str, str], *, node_ref_map: Optional[dict[str, str]]
     ) -> str:
+        """把单个 CQ token 映射为 CQCtx 内部表示。
+
+        Args:
+            typ: CQ 类型（已经归一化为小写）。
+            params: CQ 参数字典。
+            node_ref_map: 转发节点映射（见 `encode`）。
+
+        Returns:
+            CQCtx 内部表示片段；若该 token 应被忽略则返回空字符串。
+        """
         if typ == "at":
             qq = str(params.get("qq") or "").strip()
             if not qq:
@@ -665,7 +685,13 @@ class _CQCtxBodyEncoder:
 
 
 class NapCatContextBuilder:
-    """上下文构建器：输出紧凑的 CQCTX/3（群）或 CQDM/1（私聊）。"""
+    """构建 NapCat 上下文注入文本。
+
+    输出格式为紧凑的 CQCTX/3（群聊）或 CQDM/1（私聊）。
+
+    该构建器只负责把已归一化的 `ContextMessageLine` 序列序列化为文本，并在
+    同时生成反向映射（CQCtxReverseMap）供后续媒体回填/引用解析使用。
+    """
 
     def build(
         self,
@@ -677,6 +703,19 @@ class NapCatContextBuilder:
         prompts: list[str],
         messages: list[ContextMessageLine],
     ) -> str:
+        """构建用于注入到大模型的上下文文本。
+
+        Args:
+            chat: 聊天引用信息（群/私聊）。
+            bot_name: 机器人展示名。
+            bot_id: 机器人 ID。
+            time_window_label: 时间窗口标签（预留字段；当前不参与序列化）。
+            prompts: 额外提示词列表（预留字段；当前不参与序列化）。
+            messages: 已归一化的上下文消息行。
+
+        Returns:
+            序列化后的上下文文本。
+        """
         if chat.chat_type == "private":
             return self._build_dm(chat=chat, bot_name=bot_name, bot_id=bot_id, messages=messages)
         return self._build_group(chat=chat, bot_name=bot_name, bot_id=bot_id, messages=messages)
@@ -689,6 +728,17 @@ class NapCatContextBuilder:
         bot_id: str,
         messages: list[ContextMessageLine],
     ) -> CQCtxReverseMap:
+        """构建 CQCtx 反向映射表。
+
+        Args:
+            chat: 聊天引用信息。
+            bot_name: 机器人展示名。
+            bot_id: 机器人 ID。
+            messages: 上下文消息行。
+
+        Returns:
+            反向映射表，用于把 CQCtx 的短引用映射回真实 qq/文件名等。
+        """
         symbols = self._collect_symbols(
             chat=chat, bot_name=bot_name, bot_id=bot_id, messages=messages
         )
