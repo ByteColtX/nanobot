@@ -1809,6 +1809,91 @@ def make_session_key(chat: ChatRef) -> str:
     return f"napcat:{chat.chat_type}:{chat.chat_id}"
 
 
+def _unwrap_message_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """解开 debug 包装后的 message payload。"""
+
+    if "post_type" in payload:
+        return payload
+    wrapped = None
+    if isinstance(payload.get("arrayMsg"), dict):
+        wrapped = payload.get("arrayMsg")
+    elif isinstance(payload.get("stringMsg"), dict):
+        wrapped = payload.get("stringMsg")
+    return wrapped if isinstance(wrapped, dict) else payload
+
+
+def _resolve_chat_ref(payload: dict[str, Any]) -> ChatRef | None:
+    """根据 payload 推导聊天定位信息。"""
+
+    message_type = payload.get("message_type")
+    chat_type: ChatType = "group" if message_type == "group" else "private"
+    user_id = str(payload.get("user_id") or "")
+    group_id = str(payload.get("group_id") or "")
+    chat_id = group_id if chat_type == "group" else user_id
+    if not chat_id:
+        return None
+    return ChatRef(
+        chat_type=chat_type,
+        chat_id=str(chat_id),
+        user_id=user_id,
+        group_id=group_id,
+    )
+
+
+def _resolve_inbound_sender_name(payload: dict[str, Any], *, user_id: str) -> str:
+    """提取入站消息发送者名称。"""
+
+    sender = payload.get("sender") or {}
+    if not isinstance(sender, dict):
+        sender = {}
+    return (
+        str(sender.get("card") or "").strip()
+        or str(sender.get("nickname") or "").strip()
+        or str(sender.get("remark") or "").strip()
+        or user_id
+        or "unknown"
+    )
+
+
+def _resolve_inbound_timestamp(payload: dict[str, Any]) -> datetime:
+    """提取入站消息时间戳。"""
+
+    ts = payload.get("time")
+    try:
+        return datetime.fromtimestamp(int(ts)) if ts is not None else datetime.now()
+    except Exception:
+        return datetime.now()
+
+
+def _build_inbound_parse_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """构造供消息解析器使用的最小 payload。"""
+
+    message = payload.get("message")
+    if message in (None, ""):
+        message = payload.get("raw_message")
+    return {
+        "message": message,
+        "raw_message": payload.get("raw_message"),
+        "message_format": payload.get("message_format"),
+    }
+
+
+def _build_inbound_reply(parsed_message: ParsedMessage) -> QuotedMessage | None:
+    """根据解析结果构造 reply 占位结构。"""
+
+    reply_message_id = str(parsed_message.reply_id or "")
+    if not reply_message_id:
+        return None
+    return QuotedMessage(message_id=reply_message_id)
+
+
+def _resolve_at_self(parsed_message: ParsedMessage, *, self_id: str) -> bool:
+    """判断消息是否 @ 了机器人自己。"""
+
+    sid = str(self_id or "").strip()
+    return bool(sid and sid in [str(value).strip() for value in parsed_message.at_qq])
+
+
 def normalize_inbound(
     payload: dict[str, Any],
     *,
@@ -1831,62 +1916,22 @@ def normalize_inbound(
     if not isinstance(payload, dict):
         return None
 
-    # 兼容你贴的 debug 日志格式：{"stringMsg":{...},"arrayMsg":{...}}
-    if "post_type" not in payload:
-        wrapped = None
-        if isinstance(payload.get("arrayMsg"), dict):
-            wrapped = payload.get("arrayMsg")
-        elif isinstance(payload.get("stringMsg"), dict):
-            wrapped = payload.get("stringMsg")
-        if isinstance(wrapped, dict):
-            payload = wrapped
-
+    payload = _unwrap_message_payload(payload)
     if payload.get("post_type") != "message":
         return None
 
-    message_type = payload.get("message_type")
-    chat_type: ChatType = "group" if message_type == "group" else "private"
-
-    user_id = str(payload.get("user_id") or "")
-    group_id = str(payload.get("group_id") or "")
-    chat_id = group_id if chat_type == "group" else user_id
-    if not chat_id:
+    chat = _resolve_chat_ref(payload)
+    if chat is None:
         return None
 
-    sender = payload.get("sender") or {}
-    if not isinstance(sender, dict):
-        sender = {}
-
-    sender_name = (
-        str(sender.get("card") or "").strip()
-        or str(sender.get("nickname") or "").strip()
-        or str(sender.get("remark") or "").strip()
-        or user_id
-        or "unknown"
-    )
-
+    sender_name = _resolve_inbound_sender_name(payload, user_id=chat.user_id)
     message_id = str(payload.get("message_id") or "")
-
-    ts = payload.get("time")
-    try:
-        timestamp = datetime.fromtimestamp(int(ts)) if ts is not None else datetime.now()
-    except Exception:
-        timestamp = datetime.now()
-
-    message_field = payload.get("message")
-    if message_field in (None, ""):
-        message_field = payload.get("raw_message")
-
-    # 构造一个最小 payload 供消息解析器使用：
-    # - message: 取 message/raw_message 的兜底
-    # - raw_message/message_format: 原样透传
-    payload_like = {
-        "message": message_field,
-        "raw_message": payload.get("raw_message"),
-        "message_format": payload.get("message_format"),
-    }
+    timestamp = _resolve_inbound_timestamp(payload)
     parsed_message = (
-        message_parser.parse(payload=payload_like, self_id=str(self_id or ""))
+        message_parser.parse(
+            payload=_build_inbound_parse_payload(payload),
+            self_id=str(self_id or ""),
+        )
         if message_parser
         else ParsedMessage()
     )
@@ -1895,35 +1940,20 @@ def normalize_inbound(
     rendered_text = str(
         parsed_message.rendered_text or parsed_message.cq_text or text or ""
     ).strip()
-    rendered_segments = list(parsed_message.rendered_segments or [])
-
-    reply_message_id = str(parsed_message.reply_id or "")
-    reply: QuotedMessage | None = None
-    if reply_message_id:
-        reply = QuotedMessage(message_id=reply_message_id)
-
-    sid = str(self_id or "").strip()
-    at_self = bool(sid and sid in [str(x).strip() for x in parsed_message.at_qq])
-    forward_id = str(parsed_message.forward_id or "")
 
     return NormalizedInbound(
-        chat=ChatRef(
-            chat_type=chat_type,
-            chat_id=str(chat_id),
-            user_id=user_id,
-            group_id=group_id,
-        ),
-        sender_id=user_id,
+        chat=chat,
+        sender_id=chat.user_id,
         sender_name=sender_name,
         message_id=message_id,
         timestamp=timestamp,
         text=text,
         rendered_text=rendered_text,
-        rendered_segments=rendered_segments,
+        rendered_segments=list(parsed_message.rendered_segments or []),
         media=list(parsed_message.media or []),
-        at_self=at_self,
-        reply=reply,
-        forward_id=forward_id,
+        at_self=_resolve_at_self(parsed_message, self_id=self_id),
+        reply=_build_inbound_reply(parsed_message),
+        forward_id=str(parsed_message.forward_id or ""),
         raw_event=payload,
     )
 
