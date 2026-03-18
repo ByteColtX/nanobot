@@ -3003,7 +3003,7 @@ class NapCatWSChannel(BaseChannel):
         """预处理出站文本并执行轻校验。"""
 
         content = self._normalize_outbound_cq_images(str(msg.content or ""))
-        if not content.strip() and not msg.media:
+        if not content.strip():
             return None
         validation = validate_outbound_cq_text(content)
         if validation.valid:
