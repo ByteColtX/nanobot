@@ -830,36 +830,31 @@ class NapCatContextBuilder:
         Returns:
             CQCTX 文本（多行，以 `\n` 拼接）。
         """
+
         symbols = self._collect_symbols(
             chat=chat, bot_name=bot_name, bot_id=bot_id, messages=messages
         )
-        bot_ref = symbols.user_ref(
-            qq=str(bot_id or "0"), name=str(bot_name or bot_id or "bot"), is_bot=True
+        return self._build_cqctx_text(
+            chat=chat,
+            bot_name=bot_name,
+            bot_id=bot_id,
+            messages=messages,
+            symbols=symbols,
+            private_mode=False,
         )
-        rows: list[str] = [
-            f"<CQCTX/3 g:{_cqctx_escape(chat.chat_id)} bot:{bot_ref} n:{len(messages)}>"
-        ]
-        for row in symbols.user_rows:
-            suffix = "|bot" if row.get("bot") else ""
-            rows.append(
-                f"U|{row['ref']}|{_cqctx_escape(row['qq'])}|{_cqctx_escape(row['name'])}{suffix}"
-            )
-        for row in symbols.image_rows:
-            rows.append(f"I|{row['ref']}|{_cqctx_escape(row['filename'])}")
-        encoder = _CQCtxBodyEncoder(symbols=symbols, is_group=True)
-        rows.extend(
-            self._serialize_messages(
-                messages=messages,
-                symbols=symbols,
-                encoder=encoder,
-                private_mode=False,
-                bot_id=str(bot_id or ""),
-                bot_name=str(bot_name or bot_id or "bot"),
-                chat=chat,
-            )
-        )
-        rows.append("</CQCTX/3>")
-        return "\n".join(rows)
+
+    def _pick_dm_peer_name(self, *, chat: ChatRef, messages: list[ContextMessageRecord]) -> str:
+        """挑选私聊对端展示名。"""
+
+        peer_name = str(chat.user_id or "peer")
+        for message in messages:
+            if (
+                str(message.sender_id or "") == str(chat.user_id or "")
+                and str(message.sender_name or "").strip()
+            ):
+                peer_name = str(message.sender_name)
+                break
+        return peer_name
 
     def _build_dm(
         self, *, chat: ChatRef, bot_name: str, bot_id: str, messages: list[ContextMessageRecord]
@@ -885,47 +880,84 @@ class NapCatContextBuilder:
         Returns:
             CQDM 文本（多行，以 `\n` 拼接）。
         """
+
         symbols = self._collect_symbols(
             chat=chat, bot_name=bot_name, bot_id=bot_id, messages=messages
         )
-        peer_name = str(chat.user_id or "peer")
-        for m in messages:
-            if (
-                str(m.sender_id or "") == str(chat.user_id or "")
-                and str(m.sender_name or "").strip()
-            ):
-                peer_name = str(m.sender_name)
-                break
-        rows: list[str] = [f"<CQDM/1 n:{len(messages)}>"]
-        rows.append(
-            f"P|me|{_cqctx_escape(str(bot_id or ''))}|{_cqctx_escape(str(bot_name or bot_id or 'bot'))}|bot"
+        peer_name = self._pick_dm_peer_name(chat=chat, messages=messages)
+        return self._build_cqctx_text(
+            chat=chat,
+            bot_name=bot_name,
+            bot_id=bot_id,
+            messages=messages,
+            symbols=symbols,
+            private_mode=True,
+            peer_name=peer_name,
         )
-        rows.append(
-            f"P|peer|{_cqctx_escape(str(chat.user_id or chat.chat_id or ''))}|{_cqctx_escape(peer_name)}"
-        )
+
+    def _build_cqctx_text(
+        self,
+        *,
+        chat: ChatRef,
+        bot_name: str,
+        bot_id: str,
+        messages: list[ContextMessageRecord],
+        symbols: _CQCtxSymbolTable,
+        private_mode: bool,
+        peer_name: str | None = None,
+    ) -> str:
+        """构建 CQCTX/CQDM 共同的多行文本。"""
+
+        if private_mode:
+            rows: list[str] = [f"<CQDM/1 n:{len(messages)}>"]
+            rows.append(
+                "P|me|{}|{}|bot".format(
+                    _cqctx_escape(str(bot_id or "")),
+                    _cqctx_escape(str(bot_name or bot_id or "bot")),
+                )
+            )
+            rows.append(
+                "P|peer|{}|{}".format(
+                    _cqctx_escape(str(chat.user_id or chat.chat_id or "")),
+                    _cqctx_escape(str(peer_name or "peer")),
+                )
+            )
+        else:
+            bot_ref = symbols.user_ref(
+                qq=str(bot_id or "0"),
+                name=str(bot_name or bot_id or "bot"),
+                is_bot=True,
+            )
+            rows = [
+                f"<CQCTX/3 g:{_cqctx_escape(chat.chat_id)} bot:{bot_ref} n:{len(messages)}>"
+            ]
+
         for row in symbols.user_rows:
             qq_s = str(row.get("qq") or "")
-            if qq_s in {str(bot_id or ""), str(chat.user_id or chat.chat_id or "")}:
+            if private_mode and qq_s in {str(bot_id or ""), str(chat.user_id or chat.chat_id or "")}:
                 continue
             suffix = "|bot" if row.get("bot") else ""
             rows.append(
                 f"U|{row['ref']}|{_cqctx_escape(row['qq'])}|{_cqctx_escape(row['name'])}{suffix}"
             )
+
         for row in symbols.image_rows:
             rows.append(f"I|{row['ref']}|{_cqctx_escape(row['filename'])}")
-        encoder = _CQCtxBodyEncoder(symbols=symbols, is_group=False)
+
+        encoder = _CQCtxBodyEncoder(symbols=symbols, is_group=not private_mode)
         rows.extend(
             self._serialize_messages(
                 messages=messages,
                 symbols=symbols,
                 encoder=encoder,
-                private_mode=True,
+                private_mode=private_mode,
                 bot_id=str(bot_id or ""),
                 bot_name=str(bot_name or bot_id or "bot"),
                 chat=chat,
             )
         )
-        rows.append("</CQDM/1>")
+
+        rows.append("</CQDM/1>" if private_mode else "</CQCTX/3>")
         return "\n".join(rows)
 
     def _collect_symbols(
