@@ -311,7 +311,7 @@ class QuotedMessage:
 
     # 引用消息自身可能是合并转发（forward），用于在 reply_to 里展开转发内容
     forward_id: str = ""
-    forward_items: list[dict[str, Any]] = field(default_factory=list)
+    forward_items: list[ForwardItemRecord] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -341,7 +341,7 @@ class NormalizedInbound:
     # 合并转发（forward）
     forward_id: str = ""
     forward_summary: str = ""
-    forward_items: list[dict[str, Any]] = field(default_factory=list)
+    forward_items: list[ForwardItemRecord] = field(default_factory=list)
 
     raw_event: dict[str, Any] = field(default_factory=dict)
 
@@ -495,7 +495,7 @@ class ReplyRecord:
     is_bot: bool = False
 
     # 引用消息本身若包含合并转发，可在这里携带展开结果（可选）。
-    forward_items: Optional[list[dict[str, Any]]] = None
+    forward_items: Optional[list[ForwardItemRecord]] = None
     forward_summary: str = ""
 
     # 引用消息中可见的本地媒体路径（不写入上下文文本）。
@@ -1460,22 +1460,19 @@ class NapCatMessageDetailFetcher:
         item: ForwardItemRecord,
         *,
         media_paths: list[str],
-    ) -> dict[str, Any]:
-        """把 forward 节点记录转换为当前入站链路使用的结构。"""
+    ) -> ForwardItemRecord:
+        """把 forward 节点记录补齐为当前入站链路使用的统一结构。"""
 
-        return {
-            "sender_id": str(item.sender_id or ""),
-            "sender_name": str(item.sender_name or item.sender_id or "unknown"),
-            "message_id": str(item.message_id or "").strip(),
-            "time": None,
-            "text": str(item.text or ""),
-            "media": [],
-            "media_paths": list(media_paths),
-            "media_meta": list(item.media_meta or []),
-            "message": None,
-            "raw_message": None,
-            "src": str(item.source or "").strip(),
-        }
+        return ForwardItemRecord(
+            sender_id=str(item.sender_id or ""),
+            sender_name=str(item.sender_name or item.sender_id or "unknown"),
+            message_id=str(item.message_id or "").strip(),
+            text=str(item.text or ""),
+            source=str(item.source or "").strip(),
+            is_bot=bool(item.is_bot),
+            media_paths=list(media_paths),
+            media_meta=list(item.media_meta or []),
+        )
 
     @staticmethod
     def _build_fake_image_message(media_meta: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3399,40 +3396,34 @@ class NapCatWSChannel(BaseChannel):
         rec.forward_items = self._build_forward_item_records(fitems)
         return rec
 
-    def _build_forward_item_records(self, items: list[dict[str, Any]]) -> list[ForwardItemRecord]:
+    def _normalize_forward_item_record(self, item: ForwardItemRecord) -> ForwardItemRecord | None:
+        """把 forward 节点记录规范化为上下文使用的统一形态。"""
+
+        if not isinstance(item, ForwardItemRecord):
+            return None
+        rendered_text = self._truncate_user_text(str(item.text or "").strip())
+        if not rendered_text:
+            return None
+        sender_id = str(item.sender_id or "").strip()
+        return ForwardItemRecord(
+            sender_name=str(item.sender_name or sender_id or "unknown"),
+            sender_id=sender_id,
+            message_id=str(item.message_id or "").strip(),
+            text=rendered_text,
+            source=str(item.source or "").strip(),
+            is_bot=bool(item.is_bot or (sender_id and sender_id == str(self._self_id or ""))),
+            media_paths=[p for p in list(item.media_paths or []) if isinstance(p, str) and p.strip()],
+            media_meta=[m for m in list(item.media_meta or []) if isinstance(m, dict)],
+        )
+
+    def _build_forward_item_records(self, items: list[ForwardItemRecord]) -> list[ForwardItemRecord]:
         """把已 enrich 的 forward_items 投影成上下文用的 ForwardItemRecord 列表。"""
 
         rendered_items: list[ForwardItemRecord] = []
         for item in items or []:
-            if not isinstance(item, dict):
-                continue
-
-            rendered_text = self._render_context_message_text(
-                message=item.get("message"),
-                raw=item.get("raw_message"),
-            )
-            if not rendered_text:
-                rendered_text = str(item.get("text") or "").strip()
-            rendered_text = self._truncate_user_text(rendered_text)
-            if not rendered_text:
-                continue
-
-            sender_id = str(item.get("sender_id") or "").strip()
-            sender_name = str(item.get("sender_name") or sender_id or "unknown")
-            is_bot = bool(sender_id and str(sender_id) == str(self._self_id or ""))
-
-            rendered_items.append(
-                ForwardItemRecord(
-                    sender_name=sender_name,
-                    sender_id=sender_id,
-                    message_id=str(item.get("message_id") or "").strip(),
-                    text=rendered_text,
-                    source=str(item.get("src") or "").strip(),
-                    is_bot=is_bot,
-                    media_paths=list(item.get("media_paths") or []),
-                    media_meta=list(item.get("media_meta") or []),
-                )
-            )
+            normalized = self._normalize_forward_item_record(item)
+            if normalized is not None:
+                rendered_items.append(normalized)
         return rendered_items
 
     def _build_chat_context(
@@ -3479,12 +3470,10 @@ class NapCatWSChannel(BaseChannel):
         # forward_items 的 media_paths 目前是“全集合附在每个 item 上”（不做 per-node 对齐），
         # 这里只需要聚合成一份列表即可。
         try:
-            for it in msg.forward_items:
-                if not isinstance(it, dict):
-                    continue
-                for p in it.get("media_paths") or []:
-                    if isinstance(p, str) and p and p not in msg.media_paths:
-                        msg.media_paths.append(p)
+            for item in msg.forward_items:
+                for path in item.media_paths or []:
+                    if isinstance(path, str) and path and path not in msg.media_paths:
+                        msg.media_paths.append(path)
         except Exception:
             pass
 
@@ -3740,16 +3729,14 @@ class NapCatWSChannel(BaseChannel):
             try:
                 fitems = await self._fetch_forward_items(msg.reply.forward_id, msg.chat)
                 msg.reply.forward_items = fitems or msg.reply.forward_items
-                for it in msg.reply.forward_items or []:
-                    if not isinstance(it, dict):
-                        continue
-                    for p in it.get("media_paths") or []:
-                        if isinstance(p, str) and p and p not in msg.reply.media_paths:
-                            msg.reply.media_paths.append(p)
+                for item in msg.reply.forward_items or []:
+                    for path in item.media_paths or []:
+                        if isinstance(path, str) and path and path not in msg.reply.media_paths:
+                            msg.reply.media_paths.append(path)
             except Exception:
                 pass
 
-    async def _fetch_forward_items(self, forward_id: str, chat: ChatRef) -> list[dict[str, Any]]:
+    async def _fetch_forward_items(self, forward_id: str, chat: ChatRef) -> list[ForwardItemRecord]:
         """拉取并展开 forward items。
 
         Args:
@@ -3757,7 +3744,7 @@ class NapCatWSChannel(BaseChannel):
             chat: 聊天信息（用于 expand_forward 内部的私聊 src 补充）。
 
         Returns:
-            标准化后的 forward item 字典列表。
+            标准化后的 forward 节点记录列表。
         """
         fid = str(forward_id or "").strip()
         if not fid:
@@ -3992,7 +3979,7 @@ class NapCatWSChannel(BaseChannel):
             logger.debug("napcat_ws image_download_failed url={} err={}", url, exc)
             return False
 
-    def _build_forward_summary(self, items: list[dict[str, Any]]) -> str:
+    def _build_forward_summary(self, items: list[ForwardItemRecord]) -> str:
         """生成合并转发的摘要文本。
 
         Args:
@@ -4003,29 +3990,25 @@ class NapCatWSChannel(BaseChannel):
         """
         lines: list[str] = []
         for item in items:
-            who = str(item.get("sender_name") or item.get("sender_id") or "unknown")
-            text = str(item.get("text") or "").strip()
+            who = str(item.sender_name or item.sender_id or "unknown")
+            text = str(item.text or "").strip()
 
-            # 优先使用结构化 media_meta（可区分 sticker/image，并拿到 file 名）
-            media_meta = list(item.get("media_meta") or [])
+            media_meta = list(item.media_meta or [])
             if media_meta:
                 tokens: list[str] = []
-                for m in media_meta:
-                    if not isinstance(m, dict):
+                for media in media_meta:
+                    if not isinstance(media, dict):
                         continue
-                    safe_name = _safe_media_filename(str(m.get("safe_name") or m.get("file") or ""))
-                    if safe_name:
-                        typ = str(m.get("type") or "image")
-                        tokens.append(f"[{typ}:{safe_name}]")
-                    else:
-                        typ = str(m.get("type") or "image")
-                        tokens.append(f"[{typ}]")
-
+                    safe_name = _safe_media_filename(
+                        str(media.get("safe_name") or media.get("file") or "")
+                    )
+                    media_type = str(media.get("type") or "image")
+                    tokens.append(
+                        f"[{media_type}:{safe_name}]" if safe_name else f"[{media_type}]"
+                    )
                 media_token = " ".join(tokens).strip()
             else:
-                # fallback：旧逻辑只知道 url 列表
-                media = list(item.get("media") or [])
-                media_token = f"[image x{len(media)}]" if media else ""
+                media_token = f"[image x{len(item.media_paths)}]" if item.media_paths else ""
 
             if text and media_token:
                 content = f"{text} {media_token}".strip()
