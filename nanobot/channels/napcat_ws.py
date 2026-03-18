@@ -458,10 +458,10 @@ class ExpandedReply:
 
     该结构预期来源于 get_msg 的返回。
 
-    与 ContextMessageLine 的约定（已定稿）：
-      - 当前消息的 `m` 字段内仍保留 inline 的 `[CQ:reply,id=...]`（以及用户实际追加的文本）
-      - 被引用的“原消息”展开内容放到 ContextMessageLine.r（仅保留 {"u","m"}）
-      - 如果“原消息”本身包含 forward，可填充到 forward 字段（后续可继续展开）
+    与 ContextMessageRecord 的约定（已定稿）：
+      - 当前消息的 text 字段内仍保留 inline 的 `[CQ:reply,id=...]`（以及用户实际追加的文本）
+      - 被引用的“原消息”展开内容放到 ContextMessageRecord.reply
+      - 如果“原消息”本身包含 forward，可填充到 reply.forward_items（后续可继续展开）
 
     注意：这里只定义数据结构；拉取/解析/截断规则后续实现。
     """
@@ -481,13 +481,55 @@ class ExpandedReply:
 
 
 @dataclass(slots=True)
-class ContextMessageLine:
-    """规范化后的上下文消息行，供 CQCTX/3 与 CQDM/1 序列化。"""
+class ReplyRecord:
+    """引用消息的摘要记录（长字段）。
 
-    u: str
-    q: str
-    id: str
-    m: str
+    该结构用于上下文构建阶段的 reply 展开信息。
+    """
+
+    sender_name: str
+    sender_id: str
+    message_id: str
+    text: str
+    is_bot: bool = False
+
+    # 引用消息本身若包含合并转发，可在这里携带展开结果（可选）。
+    forward_items: Optional[list[dict[str, Any]]] = None
+    forward_summary: str = ""
+
+    # 引用消息中可见的本地媒体路径（不写入上下文文本）。
+    media_paths: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ForwardItemRecord:
+    """合并转发的单个节点记录（长字段）。"""
+
+    sender_name: str
+    sender_id: str
+    message_id: str
+    text: str
+    source: str = ""
+    is_bot: bool = False
+
+    # 节点内可见媒体
+    media_paths: list[str] = field(default_factory=list)
+    media_meta: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ContextMessageRecord:
+    """规范化后的上下文消息记录（长字段）。
+
+    该结构作为 session buffer 的缓存载体，字段命名更语义化。
+    NapCatContextBuilder 会基于这些字段直接序列化为 CQCTX/CQDM，
+    确保最终注入给模型的格式不变。
+    """
+
+    sender_name: str
+    sender_id: str
+    message_id: str
+    text: str
 
     # chat scope
     chat_type: ChatType = "group"
@@ -495,8 +537,8 @@ class ContextMessageLine:
     is_bot: bool = False
 
     # expansions / structured refs
-    f: Optional[list[dict[str, Any]]] = None
-    r: Optional[dict[str, Any]] = None
+    forward_items: Optional[list[ForwardItemRecord]] = None
+    reply: Optional[ReplyRecord] = None
 
     # local image paths (not serialized into text context)
     media_paths: list[str] = field(default_factory=list)
@@ -712,7 +754,7 @@ class NapCatContextBuilder:
 
     输出格式为紧凑的 CQCTX/3（群聊）或 CQDM/1（私聊）。
 
-    该构建器只负责把已归一化的 `ContextMessageLine` 序列序列化为文本，并在
+    该构建器只负责把已归一化的 `ContextMessageRecord` 序列序列化为文本，并在
     同时生成反向映射（CQCtxReverseMap）供后续媒体回填/引用解析使用。
     """
 
@@ -724,7 +766,7 @@ class NapCatContextBuilder:
         bot_id: str,
         time_window_label: str,
         prompts: list[str],
-        messages: list[ContextMessageLine],
+         messages: list[ContextMessageRecord],
     ) -> str:
         """构建用于注入到大模型的上下文文本。
 
@@ -749,7 +791,7 @@ class NapCatContextBuilder:
         chat: ChatRef,
         bot_name: str,
         bot_id: str,
-        messages: list[ContextMessageLine],
+         messages: list[ContextMessageRecord],
     ) -> CQCtxReverseMap:
         """构建 CQCtx 反向映射表。
 
@@ -768,7 +810,7 @@ class NapCatContextBuilder:
         return symbols.reverse
 
     def _build_group(
-        self, *, chat: ChatRef, bot_name: str, bot_id: str, messages: list[ContextMessageLine]
+        self, *, chat: ChatRef, bot_name: str, bot_id: str, messages: list[ContextMessageRecord]
     ) -> str:
         symbols = self._collect_symbols(
             chat=chat, bot_name=bot_name, bot_id=bot_id, messages=messages
@@ -802,15 +844,18 @@ class NapCatContextBuilder:
         return "\n".join(rows)
 
     def _build_dm(
-        self, *, chat: ChatRef, bot_name: str, bot_id: str, messages: list[ContextMessageLine]
+        self, *, chat: ChatRef, bot_name: str, bot_id: str, messages: list[ContextMessageRecord]
     ) -> str:
         symbols = self._collect_symbols(
             chat=chat, bot_name=bot_name, bot_id=bot_id, messages=messages
         )
         peer_name = str(chat.user_id or "peer")
         for m in messages:
-            if str(m.q or "") == str(chat.user_id or "") and str(m.u or "").strip():
-                peer_name = str(m.u)
+            if (
+                str(m.sender_id or "") == str(chat.user_id or "")
+                and str(m.sender_name or "").strip()
+            ):
+                peer_name = str(m.sender_name)
                 break
         rows: list[str] = [f"<CQDM/1 n:{len(messages)}>"]
         rows.append(
@@ -845,7 +890,7 @@ class NapCatContextBuilder:
         return "\n".join(rows)
 
     def _collect_symbols(
-        self, *, chat: ChatRef, bot_name: str, bot_id: str, messages: list[ContextMessageLine]
+        self, *, chat: ChatRef, bot_name: str, bot_id: str, messages: list[ContextMessageRecord]
     ) -> _CQCtxSymbolTable:
         symbols = _CQCtxSymbolTable()
         if chat.chat_type == "group":
@@ -862,14 +907,14 @@ class NapCatContextBuilder:
             )
         for line in messages:
             symbols.user_ref(
-                qq=str(line.q or "0"),
-                name=str(line.u or line.q or "unknown"),
+                qq=str(line.sender_id or "0"),
+                name=str(line.sender_name or line.sender_id or "unknown"),
                 is_bot=bool(line.is_bot),
             )
             self._collect_line_assets(line=line, symbols=symbols)
         return symbols
 
-    def _collect_line_assets(self, *, line: ContextMessageLine, symbols: _CQCtxSymbolTable) -> None:
+    def _collect_line_assets(self, *, line: ContextMessageRecord, symbols: _CQCtxSymbolTable) -> None:
         """从单条上下文消息行收集需要写入符号表的实体。
 
         目前会收集：
@@ -882,26 +927,29 @@ class NapCatContextBuilder:
             line: 上下文消息行。
             symbols: CQCtx 符号表。
         """
-        self._collect_images_from_text(line.m, symbols)
-        if isinstance(line.r, dict):
-            qq = str(line.r.get("q") or "").strip()
-            name = str(line.r.get("u") or qq or "unknown")
+        self._collect_images_from_text(line.text, symbols)
+
+        if isinstance(line.reply, ReplyRecord):
+            qq = str(line.reply.sender_id or "").strip()
+            name = str(line.reply.sender_name or qq or "unknown")
             if qq:
-                symbols.user_ref(qq=qq, name=name, is_bot=bool(line.r.get("bot")))
-            self._collect_images_from_text(str(line.r.get("m") or ""), symbols)
+                symbols.user_ref(qq=qq, name=name, is_bot=bool(line.reply.is_bot))
+            self._collect_images_from_text(str(line.reply.text or ""), symbols)
+
         for p in list(getattr(line, "media_paths", None) or []):
             fn = _cqctx_filename_from_path(p)
             if fn:
                 symbols.image_ref(fn)
-        for node in list(line.f or []):
-            if not isinstance(node, dict):
+
+        for node in list(line.forward_items or []):
+            if not isinstance(node, ForwardItemRecord):
                 continue
-            qq = str(node.get("q") or "").strip()
-            name = str(node.get("u") or qq or "unknown")
+            qq = str(node.sender_id or "").strip()
+            name = str(node.sender_name or qq or "unknown")
             if qq:
-                symbols.user_ref(qq=qq, name=name, is_bot=bool(node.get("bot")))
-            self._collect_images_from_text(str(node.get("m") or ""), symbols)
-            for p in list(node.get("media_paths") or []):
+                symbols.user_ref(qq=qq, name=name, is_bot=bool(node.is_bot))
+            self._collect_images_from_text(str(node.text or ""), symbols)
+            for p in list(node.media_paths or []):
                 fn = _cqctx_filename_from_path(p)
                 if fn:
                     symbols.image_ref(fn)
@@ -929,7 +977,7 @@ class NapCatContextBuilder:
     def _serialize_messages(
         self,
         *,
-        messages: list[ContextMessageLine],
+         messages: list[ContextMessageRecord],
         symbols: _CQCtxSymbolTable,
         encoder: _CQCtxBodyEncoder,
         private_mode: bool,
@@ -960,30 +1008,36 @@ class NapCatContextBuilder:
                 bot_id=bot_id,
                 peer_id=str(chat.user_id or chat.chat_id or ""),
             )
-            body = encoder.encode(line.m)
+            body = encoder.encode(line.text)
             forward_rows: list[str] = []
-            if line.f:
+            if line.forward_items:
                 fid = symbols.new_forward_ref()
                 if body:
                     body = f"{body} [F:{fid}]".strip()
                 else:
                     body = f"[F:{fid}]"
-                summary = (
-                    str((line.r or {}).get("forward_summary") or "").strip()
-                    if isinstance(line.r, dict)
-                    else ""
-                )
+
+                summary = ""
+                if isinstance(line.reply, ReplyRecord):
+                    summary = str(line.reply.forward_summary or "").strip()
                 if not summary:
                     summary = str(getattr(line, "forward_summary", "") or "").strip()
                 summary_part = f"|{_cqctx_escape(summary)}" if summary else ""
-                forward_rows.append(f"F|{fid}|{len(line.f)}{summary_part}")
+
+                forward_rows.append(f"F|{fid}|{len(line.forward_items)}{summary_part}")
+
                 node_ref_map: dict[str, str] = {}
-                for idx, node in enumerate(line.f):
+                for idx, node in enumerate(line.forward_items):
+                    if not isinstance(node, ForwardItemRecord):
+                        continue
                     node_ref = f"{fid}.{idx}"
-                    node_msg_id = str(node.get("id") or "").strip()
+                    node_msg_id = str(node.message_id or "").strip()
                     if node_msg_id:
                         node_ref_map[node_msg_id] = node_ref
-                for idx, node in enumerate(line.f):
+
+                for idx, node in enumerate(line.forward_items):
+                    if not isinstance(node, ForwardItemRecord):
+                        continue
                     node_ref = f"{fid}.{idx}"
                     node_sender = self._node_sender_ref(
                         node=node,
@@ -992,53 +1046,57 @@ class NapCatContextBuilder:
                         bot_id=bot_id,
                         peer_id=str(chat.user_id or chat.chat_id or ""),
                     )
-                    node_body = encoder.encode(str(node.get("m") or ""), node_ref_map=node_ref_map)
+                    node_body = encoder.encode(str(node.text or ""), node_ref_map=node_ref_map)
                     if private_mode:
-                        src = str(node.get("src") or "").strip()
+                        src = str(node.source or "").strip()
                         src_part = f"|{_cqctx_escape(src)}" if src else ""
                         forward_rows.append(f"N|{node_ref}|{node_sender}{src_part}|{node_body}")
                     else:
                         forward_rows.append(f"N|{node_ref}|{node_sender}|{node_body}")
-            rows.append(f"M|{_cqctx_escape(line.id)}|{sender_ref}|{body}")
+            rows.append(f"M|{_cqctx_escape(line.message_id)}|{sender_ref}|{body}")
             rows.extend(forward_rows)
         return rows
 
     def _sender_ref(
         self,
         *,
-        line: ContextMessageLine,
+        line: ContextMessageRecord,
         symbols: _CQCtxSymbolTable,
         private_mode: bool,
         bot_id: str,
         peer_id: str,
     ) -> str:
-        qq = str(line.q or "")
+        qq = str(line.sender_id or "")
         if private_mode:
             if qq == str(bot_id or ""):
                 return "me"
             if qq == str(peer_id or ""):
                 return "peer"
         return symbols.user_ref(
-            qq=qq, name=str(line.u or qq or "unknown"), is_bot=bool(line.is_bot)
+            qq=qq,
+            name=str(line.sender_name or qq or "unknown"),
+            is_bot=bool(line.is_bot),
         )
 
     def _node_sender_ref(
         self,
         *,
-        node: dict[str, Any],
+        node: ForwardItemRecord,
         symbols: _CQCtxSymbolTable,
         private_mode: bool,
         bot_id: str,
         peer_id: str,
     ) -> str:
-        qq = str(node.get("q") or "")
+        qq = str(node.sender_id or "")
         if private_mode:
             if qq == str(bot_id or ""):
                 return "me"
             if qq == str(peer_id or ""):
                 return "peer"
         return symbols.user_ref(
-            qq=qq, name=str(node.get("u") or qq or "unknown"), is_bot=bool(node.get("bot"))
+            qq=qq,
+            name=str(node.sender_name or qq or "unknown"),
+            is_bot=bool(node.is_bot),
         )
 
 
@@ -1477,7 +1535,7 @@ class SessionBufferState:
         - 只保留最近 N 条（N=buffer_size）。
     """
 
-    messages: Deque[ContextMessageLine]
+    messages: Deque[ContextMessageRecord]
     bot_message_ids: Deque[str]
 
 
@@ -1509,7 +1567,7 @@ class SessionBufferStore:
             )
         return self._sessions[session_key]
 
-    def append_message(self, session_key: str, line: ContextMessageLine) -> None:
+    def append_message(self, session_key: str, line: ContextMessageRecord) -> None:
         """向指定 session 追加一条上下文消息。
 
         Args:
@@ -1518,7 +1576,7 @@ class SessionBufferStore:
         """
         self.get_or_create(session_key).messages.append(line)
 
-    def recent_messages(self, session_key: str, limit: int) -> list[ContextMessageLine]:
+    def recent_messages(self, session_key: str, limit: int) -> list[ContextMessageRecord]:
         """获取指定 session 的最近 N 条消息。
 
         Args:
@@ -2780,11 +2838,11 @@ class NapCatWSChannel(BaseChannel):
                         self._store.remember_bot_message_id(session_key, str(mid))
                         self._store.append_message(
                             session_key,
-                            ContextMessageLine(
-                                u=str(sender_name),
-                                q=str(self._self_id or ""),
-                                id=str(mid),
-                                m=str(content),
+                            ContextMessageRecord(
+                                sender_name=str(sender_name),
+                                sender_id=str(self._self_id or ""),
+                                message_id=str(mid),
+                                text=str(content),
                                 chat_type=str(msg.metadata.get("chat_type") or "group"),
                                 group_id=str(msg.metadata.get("group_id") or ""),
                                 is_bot=True,
@@ -2871,7 +2929,7 @@ class NapCatWSChannel(BaseChannel):
           Normalize(轻量) -> Policy -> Session/Context(session buffer) -> Agent(bus) -> Outbound(send)
 
         注意：notice 没有天然的 message_id/message 段，因此这里会生成一个稳定的“事件 id”，并用
-        一条 ContextMessageLine 记录到 session buffer 中。
+        一条 ContextMessageRecord 记录到 session buffer 中。
         """
 
         decision = decide_notice_trigger(
@@ -2929,15 +2987,15 @@ class NapCatWSChannel(BaseChannel):
             ts_i = int(time.time())
         event_id = f"notice:{notice_type}:{sub_type}:{ts_i}:{actor}:{group_id or 'private'}"
 
-        # 入库一条 context line：让 poke 成为“可见上下文事件”
+        # 入库一条 context record：让 poke 成为“可见上下文事件”
         poke_text = "(poke)"
         self._store.append_message(
             session_key,
-            ContextMessageLine(
-                u=str(sender_name),
-                q=str(actor),
-                id=event_id,
-                m=poke_text,
+            ContextMessageRecord(
+                sender_name=str(sender_name),
+                sender_id=str(actor),
+                message_id=event_id,
+                text=poke_text,
                 chat_type=chat.chat_type,
                 group_id=str(group_id or ""),
                 is_bot=False,
@@ -3053,8 +3111,17 @@ class NapCatWSChannel(BaseChannel):
     # JSON lines 上下文（立刻启用）
     # ------------------------------
 
-    async def _build_context_line(self, msg: NormalizedInbound) -> ContextMessageLine:
-        """把当前归一化消息投影成上下文行；只做 projection/render，不做详情补全。"""
+    async def _build_context_record(self, msg: NormalizedInbound) -> ContextMessageRecord:
+        """把当前归一化消息投影成上下文记录（长字段）。
+
+        只做 projection/render，不在此处做详情补全（reply/forward 的展开发生在 enrich 阶段）。
+
+        Args:
+            msg: 已归一化（必要时已 enrich）的入站消息。
+
+        Returns:
+            上下文记录。
+        """
 
         rendered_text = self._render_context_message_text(
             message=msg.raw_event.get("message"),
@@ -3065,48 +3132,53 @@ class NapCatWSChannel(BaseChannel):
                 msg.raw_event.get("raw_message") or msg.rendered_text or msg.text or ""
             ).strip()
 
-        line = ContextMessageLine(
-            u=str(msg.sender_name or msg.sender_id or "unknown"),
-            q=str(msg.sender_id or ""),
-            id=str(msg.message_id or ""),
-            m=self._truncate_user_text(rendered_text),
+        record = ContextMessageRecord(
+            sender_name=str(msg.sender_name or msg.sender_id or "unknown"),
+            sender_id=str(msg.sender_id or ""),
+            message_id=str(msg.message_id or ""),
+            text=self._truncate_user_text(rendered_text),
             chat_type=msg.chat.chat_type,
             group_id=str(msg.chat.group_id or ""),
             is_bot=(str(msg.sender_id or "") == str(self._self_id or "")),
         )
 
-        line.r = self._build_context_reply_line(msg.reply)
-        line.f = self._build_context_forward_lines(msg.forward_items)
-        return line
+        record.reply = self._build_reply_record(msg.reply)
+        record.forward_items = self._build_forward_item_records(msg.forward_items)
+        return record
 
-    def _build_context_reply_line(self, reply: QuotedMessage | None) -> dict[str, Any] | None:
-        """把已 enrich 的 reply 投影成上下文里的 `r` 字段。"""
+    def _build_reply_record(self, reply: QuotedMessage | None) -> ReplyRecord | None:
+        """把已 enrich 的 reply 投影成上下文用的 ReplyRecord。"""
 
         if reply is None or not str(reply.message_id or "").strip():
             return None
 
-        rendered_text = self._render_context_message_text(
-            message=reply.message, raw=reply.raw_message
-        )
+        rendered_text = self._render_context_message_text(message=reply.message, raw=reply.raw_message)
         if not rendered_text:
             rendered_text = str(reply.text or "").strip()
         rendered_text = self._truncate_user_text(rendered_text)
+
         sender_name = str(reply.sender_name or reply.sender_id or "unknown")
         if not sender_name or not rendered_text:
             return None
 
-        return {
-            "u": sender_name,
-            "q": str(reply.sender_id or ""),
-            "m": rendered_text,
-            "id": str(reply.message_id or "").strip(),
-            "bot": (str(reply.sender_id or "") == str(self._self_id or "")),
-        }
+        rec = ReplyRecord(
+            sender_name=sender_name,
+            sender_id=str(reply.sender_id or ""),
+            message_id=str(reply.message_id or "").strip(),
+            text=rendered_text,
+            is_bot=(str(reply.sender_id or "") == str(self._self_id or "")),
+            forward_summary=str(reply.forward_summary or "").strip(),
+            media_paths=list(getattr(reply, "media_paths", None) or []),
+        )
 
-    def _build_context_forward_lines(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """把已 enrich 的 forward_items 投影成上下文里的 `f` 字段。"""
+        fitems = list(getattr(reply, "forward_items", None) or [])
+        rec.forward_items = self._build_forward_item_records(fitems)
+        return rec
 
-        rendered_items: list[dict[str, Any]] = []
+    def _build_forward_item_records(self, items: list[dict[str, Any]]) -> list[ForwardItemRecord]:
+        """把已 enrich 的 forward_items 投影成上下文用的 ForwardItemRecord 列表。"""
+
+        rendered_items: list[ForwardItemRecord] = []
         for item in items or []:
             if not isinstance(item, dict):
                 continue
@@ -3121,15 +3193,21 @@ class NapCatWSChannel(BaseChannel):
             if not rendered_text:
                 continue
 
+            sender_id = str(item.get("sender_id") or "").strip()
+            sender_name = str(item.get("sender_name") or sender_id or "unknown")
+            is_bot = bool(sender_id and str(sender_id) == str(self._self_id or ""))
+
             rendered_items.append(
-                {
-                    "u": str(item.get("sender_name") or item.get("sender_id") or "unknown"),
-                    "q": str(item.get("sender_id") or "").strip(),
-                    "id": str(item.get("message_id") or "").strip(),
-                    "m": rendered_text,
-                    "src": str(item.get("src") or "").strip(),
-                    "media_paths": list(item.get("media_paths") or []),
-                }
+                ForwardItemRecord(
+                    sender_name=sender_name,
+                    sender_id=sender_id,
+                    message_id=str(item.get("message_id") or "").strip(),
+                    text=rendered_text,
+                    source=str(item.get("src") or "").strip(),
+                    is_bot=is_bot,
+                    media_paths=list(item.get("media_paths") or []),
+                    media_meta=list(item.get("media_meta") or []),
+                )
             )
         return rendered_items
 
@@ -3195,7 +3273,7 @@ class NapCatWSChannel(BaseChannel):
         """
         # 始终缓存一条 JSON line（用于构建 <NAPCAT_WS_CONTEXT>）
         try:
-            context_line = await self._build_context_line(msg)
+            context_line = await self._build_context_record(msg)
             # 关键修复：把“这条消息可见的图片”也存进 context_line（但不写入上下文文本）。
             # 这样后续触发时可以把历史图片合并进 InboundMessage.media。
             try:
@@ -3212,7 +3290,7 @@ class NapCatWSChannel(BaseChannel):
         会合并：
         - 当前消息的图片（`msg.media_paths`）
         - 引用消息的图片（`msg.reply.media_paths`）
-        - 历史窗口中缓存的图片（`ContextMessageLine.media_paths`）
+        - 历史窗口中缓存的图片（`ContextMessageRecord.media_paths`）
 
         Args:
             msg: 已 enrich 的入站消息。
@@ -3224,7 +3302,7 @@ class NapCatWSChannel(BaseChannel):
         # 关键修复：历史/引用/合并转发图片的可见性。
         # - 当前消息图片：msg.media_paths
         # - 引用消息图片：msg.reply.media_paths
-        # - 历史窗口图片：来自 store 里 ContextMessageLine.media_paths（不写入上下文文本，仅用于本轮 media 合并）
+        # - 历史窗口图片：来自 store 里 ContextMessageRecord.media_paths（不写入上下文文本，仅用于本轮 media 合并）
         merged_media: list[str] = []
         try:
             for p in msg.media_paths or []:
