@@ -237,6 +237,15 @@ class InMemoryMessageCache:
         return time.time()
 
     def _get(self, store: OrderedDict[str, tuple[float, Any]], key: str) -> Any | None:
+        """从缓存中读取一个条目，并按 TTL 规则失效。
+
+        Args:
+            store: 具体的缓存存储（reply 或 forward）。
+            key: 缓存 key。
+
+        Returns:
+            命中且未过期时返回缓存值；否则返回 None。
+        """
         k = str(key or "").strip()
         if not k:
             return None
@@ -253,6 +262,14 @@ class InMemoryMessageCache:
     def _set(
         self, store: OrderedDict[str, tuple[float, Any]], key: str, value: Any, maxsize: int
     ) -> None:
+        """写入缓存条目，并按 maxsize 做简单 LRU 淘汰。
+
+        Args:
+            store: 具体的缓存存储（reply 或 forward）。
+            key: 缓存 key。
+            value: 缓存值。
+            maxsize: 最大容量。
+        """
         k = str(key or "").strip()
         if not k:
             return
@@ -1899,7 +1916,18 @@ def decide_message_trigger(
     session_key: str,
     self_id: str,
 ) -> TriggerDecision:
-    """决定 message 事件是否触发回复。"""
+    """决定 message 事件是否触发回复。
+
+    Args:
+        msg: 入站消息。
+        config: 渠道配置。
+        store: 会话缓存（用于 reply_to_bot 兜底判断等）。
+        session_key: 会话 key。
+        self_id: 机器人自身 ID。
+
+    Returns:
+        触发决策结果。
+    """
 
     gate = _check_message_source_gate(msg, config=config, self_id=self_id)
     if gate is not None:
