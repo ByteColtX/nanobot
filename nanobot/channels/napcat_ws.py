@@ -776,7 +776,7 @@ class NapCatContextBuilder:
             bot_id: 机器人 ID。
             time_window_label: 时间窗口标签（预留字段；当前不参与序列化）。
             prompts: 额外提示词列表（预留字段；当前不参与序列化）。
-            messages: 已归一化的上下文消息行。
+            messages: 已归一化的上下文记录。
 
         Returns:
             序列化后的上下文文本。
@@ -799,7 +799,7 @@ class NapCatContextBuilder:
             chat: 聊天引用信息。
             bot_name: 机器人展示名。
             bot_id: 机器人 ID。
-            messages: 上下文消息行。
+            messages: 上下文记录。
 
         Returns:
             反向映射表，用于把 CQCtx 的短引用映射回真实 qq/文件名等。
@@ -915,7 +915,7 @@ class NapCatContextBuilder:
         return symbols
 
     def _collect_line_assets(self, *, line: ContextMessageRecord, symbols: _CQCtxSymbolTable) -> None:
-        """从单条上下文消息行收集需要写入符号表的实体。
+        """从单条上下文记录收集需要写入符号表的实体。
 
         目前会收集：
         - 行内图片（CQ image token）
@@ -924,7 +924,7 @@ class NapCatContextBuilder:
         - forward 节点中的用户与图片
 
         Args:
-            line: 上下文消息行。
+            line: 上下文记录。
             symbols: CQCtx 符号表。
         """
         self._collect_images_from_text(line.text, symbols)
@@ -985,10 +985,10 @@ class NapCatContextBuilder:
         bot_name: str,
         chat: ChatRef,
     ) -> list[str]:
-        """把上下文消息行序列化为 CQCTX/CQDM 的行列表。
+        """把上下文记录序列化为 CQCTX/CQDM 的行列表。
 
         Args:
-            messages: 上下文消息行。
+            messages: 上下文记录。
             symbols: CQCtx 符号表。
             encoder: CQCtx body 编码器。
             private_mode: 是否为私聊模式（决定 sender ref 的规则）。
@@ -1567,14 +1567,14 @@ class SessionBufferStore:
             )
         return self._sessions[session_key]
 
-    def append_message(self, session_key: str, line: ContextMessageRecord) -> None:
+    def append_message(self, session_key: str, record: ContextMessageRecord) -> None:
         """向指定 session 追加一条上下文消息。
 
         Args:
             session_key: 会话 key。
-            line: 消息行。
+            record: 上下文记录。
         """
-        self.get_or_create(session_key).messages.append(line)
+        self.get_or_create(session_key).messages.append(record)
 
     def recent_messages(self, session_key: str, limit: int) -> list[ContextMessageRecord]:
         """获取指定 session 的最近 N 条消息。
@@ -1584,7 +1584,7 @@ class SessionBufferStore:
             limit: 返回条数上限；<=0 返回空列表。
 
         Returns:
-            最近的消息行列表（按原始顺序）。
+            最近的上下文记录列表（按原始顺序）。
         """
         if limit <= 0:
             return []
@@ -2010,6 +2010,26 @@ def decide_message_trigger(
     return _decide_message_probability_trigger(msg, config=config, session_key=session_key)
 
 
+def _is_allowed_notice_source(
+    *, actor_id: str, group_id: str, config: NapCatWSConfig
+) -> bool:
+    """allow_from 白名单判断（notice 版本）。
+
+    仅支持三种语义：
+      - "*"：全部允许
+      - "<群号>"：允许对应群聊 notice
+      - "<QQ号>"：允许对应私聊 / 对应发起者
+    """
+
+    allow = [str(x).strip() for x in (getattr(config, "allow_from", []) or []) if str(x).strip()]
+    if not allow or "*" in allow:
+        return True
+    if group_id:
+        return group_id in allow
+    return bool(actor_id and actor_id in allow)
+
+
+
 def decide_notice_trigger(
     payload: dict[str, Any],
     *,
@@ -2051,13 +2071,8 @@ def decide_notice_trigger(
         if actor in blk:
             return TriggerDecision(False, "blacklist_private")
 
-    allow_list = [str(x) for x in (getattr(config, "allow_from", []) or []) if str(x).strip()]
-    if allow_list and "*" not in allow_list:
-        if group_id:
-            if group_id not in allow_list:
-                return TriggerDecision(False, "not_allowed")
-        elif actor not in allow_list:
-            return TriggerDecision(False, "not_allowed")
+    if not _is_allowed_notice_source(actor_id=actor, group_id=group_id, config=config):
+        return TriggerDecision(False, "not_allowed")
 
     return TriggerDecision(True, "poke", "poke")
 
@@ -3003,8 +3018,37 @@ class NapCatWSChannel(BaseChannel):
         )
 
         self._log_notice_decision(decision)
+        await self._publish_notice_inbound(
+            payload=payload,
+            chat=chat,
+            session_key=session_key,
+            actor=actor,
+            sender_name=sender_name,
+            event_id=event_id,
+            timestamp=datetime.fromtimestamp(ts_i),
+            notice_type=notice_type,
+            sub_type=sub_type,
+            decision=decision,
+        )
+        return
 
-        # 需要回复：构建 <NAPCAT_WS_CONTEXT> 并交给 agent
+    async def _publish_notice_inbound(
+        self,
+        *,
+        payload: dict[str, Any],
+        chat: ChatRef,
+        session_key: str,
+        actor: str,
+        sender_name: str,
+        event_id: str,
+        timestamp: datetime,
+        notice_type: str,
+        sub_type: str,
+        decision: TriggerDecision,
+    ) -> None:
+        """构建并发布 notice 对应的 agent 入站消息。"""
+
+        poke_text = "(poke)"
         bot_name = ""
         try:
             if chat.chat_type == "group" and chat.group_id:
@@ -3017,7 +3061,7 @@ class NapCatWSChannel(BaseChannel):
             sender_id=str(actor),
             sender_name=str(sender_name),
             message_id=event_id,
-            timestamp=datetime.fromtimestamp(ts_i),
+            timestamp=timestamp,
             text=poke_text,
             rendered_text=poke_text,
             raw_event=dict(payload),
@@ -3047,7 +3091,6 @@ class NapCatWSChannel(BaseChannel):
             session_key_override=session_key,
         )
         await self.bus.publish_inbound(inbound)
-        return
 
     def _extract_notice_actor_name(self, payload: dict[str, Any], fallback: str) -> str:
         """Best-effort actor display name for notice events (no network calls)."""
@@ -3108,7 +3151,7 @@ class NapCatWSChannel(BaseChannel):
     # ------------------------------
 
     # ------------------------------
-    # JSON lines 上下文（立刻启用）
+    # 上下文记录（立刻启用）
     # ------------------------------
 
     async def _build_context_record(self, msg: NormalizedInbound) -> ContextMessageRecord:
@@ -3264,25 +3307,24 @@ class NapCatWSChannel(BaseChannel):
         except Exception:
             pass
 
-    async def _cache_message_line(self, *, msg: NormalizedInbound, session_key: str) -> None:
+    async def _cache_context_record(self, *, msg: NormalizedInbound, session_key: str) -> None:
         """把当前消息写入 session buffer。
 
         Args:
             msg: 已 enrich 的入站消息。
             session_key: 会话 key。
         """
-        # 始终缓存一条 JSON line（用于构建 <NAPCAT_WS_CONTEXT>）
         try:
-            context_line = await self._build_context_record(msg)
-            # 关键修复：把“这条消息可见的图片”也存进 context_line（但不写入上下文文本）。
+            context_record = await self._build_context_record(msg)
+            # 把“这条消息可见的图片”也存进上下文记录，但不写入上下文文本。
             # 这样后续触发时可以把历史图片合并进 InboundMessage.media。
             try:
-                context_line.media_paths = list(msg.media_paths or [])
+                context_record.media_paths = list(msg.media_paths or [])
             except Exception:
                 pass
-            self._store.append_message(session_key, context_line)
+            self._store.append_message(session_key, context_record)
         except Exception as exc:
-            logger.debug("napcat_ws build_context_line_failed err={}", exc)
+            logger.debug("napcat_ws build_context_record_failed err={}", exc)
 
     def _collect_visible_media(self, *, msg: NormalizedInbound, session_key: str) -> list[str]:
         """汇总本轮对模型“可见”的媒体文件路径。
@@ -3322,8 +3364,8 @@ class NapCatWSChannel(BaseChannel):
         try:
             hist_limit = int(getattr(self.config, "context_max_messages", 20) or 20)
             hist = self._store.recent_messages(session_key, hist_limit)
-            for line in hist:
-                for p in getattr(line, "media_paths", None) or []:
+            for record in hist:
+                for p in getattr(record, "media_paths", None) or []:
                     if isinstance(p, str) and p and p not in merged_media:
                         merged_media.append(p)
         except Exception:
@@ -3371,6 +3413,38 @@ class NapCatWSChannel(BaseChannel):
             session_key_override=session_key,
         )
 
+    async def _publish_message_inbound(
+        self,
+        *,
+        msg: NormalizedInbound,
+        session_key: str,
+        decision: TriggerDecision,
+    ) -> None:
+        """构建 message 对应的 agent 入站消息并发布。"""
+
+        bot_name = ""
+        try:
+            if msg.chat.chat_type == "group" and msg.chat.group_id:
+                bot_name = await self._get_bot_display_name_for_group(msg.chat.group_id)
+        except Exception:
+            bot_name = ""
+
+        content = self._build_chat_context(
+            msg=msg,
+            session_key=session_key,
+            bot_name=bot_name,
+        )
+        merged_media = self._collect_visible_media(msg=msg, session_key=session_key)
+
+        inbound = self._build_agent_inbound(
+            msg=msg,
+            session_key=session_key,
+            content=content,
+            merged_media=merged_media,
+            decision=decision,
+        )
+        await self.bus.publish_inbound(inbound)
+
     async def _handle_message(self, payload: dict[str, Any]) -> None:
         """处理 OneBot message 事件。
 
@@ -3402,7 +3476,7 @@ class NapCatWSChannel(BaseChannel):
             self_id=str(self._self_id or ""),
         )
 
-        await self._cache_message_line(msg=msg, session_key=session_key)
+        await self._cache_context_record(msg=msg, session_key=session_key)
 
         # 缓存 bot 自己的昵称（用于把 @self 渲染成 @昵称；不影响其它逻辑）
         if msg.at_self and msg.chat.chat_type == "group":
@@ -3419,32 +3493,14 @@ class NapCatWSChannel(BaseChannel):
         if not decision.should_reply:
             return
 
-        bot_name = ""
-        try:
-            if msg.chat.chat_type == "group" and msg.chat.group_id:
-                bot_name = await self._get_bot_display_name_for_group(msg.chat.group_id)
-        except Exception:
-            bot_name = ""
-
-        content = self._build_chat_context(
-            msg=msg,
-            session_key=session_key,
-            bot_name=bot_name,
-        )
-
-        merged_media = self._collect_visible_media(msg=msg, session_key=session_key)
-
         # 交给 agent（MessageBus）生成回复；NapCat 的 send() 会把 OutboundMessage 发回平台
         # 注意：群聊白名单是 group_id 级别的，BaseChannel 的 sender_id allowlist 无法表达。
         # 因此这里不再调用 super()._handle_message()，而是直接 publish inbound。
-        inbound = self._build_agent_inbound(
+        await self._publish_message_inbound(
             msg=msg,
             session_key=session_key,
-            content=content,
-            merged_media=merged_media,
             decision=decision,
         )
-        await self.bus.publish_inbound(inbound)
         return
 
     async def _expand_quote(self, msg: NormalizedInbound) -> None:
