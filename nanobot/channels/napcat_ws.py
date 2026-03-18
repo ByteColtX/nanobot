@@ -193,7 +193,6 @@ ACTION_GET_LOGIN_INFO = "get_login_info"
 ACTION_GET_MSG = "get_msg"
 ACTION_GET_FORWARD_MSG = "get_forward_msg"
 ACTION_GET_GROUP_MEMBER_INFO = "get_group_member_info"
-ACTION_SEND_POKE = "send_poke"
 
 # Cache TTL（秒）
 CACHE_TTL_1D_SECONDS = 60 * 60 * 24
