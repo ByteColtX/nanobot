@@ -1260,13 +1260,38 @@ class NapCatMessageParser:
 
 
 class NapCatMessageDetailFetcher:
-    """消息详情获取器：包装 NapCatTransport.call_action()."""
+    """获取 reply/forward 的消息详情，并转换为内部可用结构。
+
+    该类封装了对 `NapCatTransport.call_action()` 的调用，并复用
+    `NapCatMessageParser` 把返回的 message/raw_message 解析为精简 CQ 文本。
+
+    主要用于：
+    - 展开引用消息（reply）
+    - 展开合并转发（forward）
+
+    注意：该类只做“抓取与最小解析”，下载媒体与更深层的归一化在其它层完成。
+    """
 
     def __init__(self, *, transport: "NapCatTransport", parser: NapCatMessageParser) -> None:
+        """初始化消息详情获取器。
+
+        Args:
+            transport: NapCat WS transport（负责 action 调用）。
+            parser: 消息解析器（负责把 message/raw_message 解析成精简 CQ）。
+        """
         self._transport = transport
         self._parser = parser
 
     async def expand_reply(self, *, message_id: str, chat: ChatRef) -> ExpandedReply:
+        """展开引用消息（reply）。
+
+        Args:
+            message_id: 被引用的 message_id。
+            chat: 当前聊天信息（用于在必要时展开 forward）。
+
+        Returns:
+            展开后的引用消息结构。若获取失败，至少会返回包含 `id` 的结构。
+        """
         mid = str(message_id or "").strip()
         if not mid:
             return ExpandedReply(id="")
@@ -1318,6 +1343,15 @@ class NapCatMessageDetailFetcher:
         )
 
     async def expand_forward(self, *, forward_id: str, chat: ChatRef) -> ExpandedForward:
+        """展开合并转发（forward）。
+
+        Args:
+            forward_id: forward id。
+            chat: 当前聊天信息（用于私聊场景下补充节点来源 src）。
+
+        Returns:
+            展开后的转发结构。若获取失败，至少会返回包含 `id` 的结构。
+        """
         fid = str(forward_id or "").strip()
         if not fid:
             return ExpandedForward(id="")
