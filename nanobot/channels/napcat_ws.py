@@ -1491,6 +1491,94 @@ class NapCatMessageDetailFetcher:
             fake_message.append({"type": "image", "data": {"url": url, "file": name}})
         return fake_message
 
+    @staticmethod
+    def _extract_sender_identity(sender: Any, *, fallback_user_id: Any = None) -> tuple[str, str]:
+        """从 sender 字段提取 `(sender_id, sender_name)`。"""
+
+        sender_dict = sender if isinstance(sender, dict) else {}
+        sender_id = str(sender_dict.get("user_id") or fallback_user_id or "").strip()
+        sender_name = str(
+            sender_dict.get("card") or sender_dict.get("nickname") or sender_id or "unknown"
+        ).strip()
+        return sender_id, sender_name
+
+    def _build_expanded_reply(
+        self,
+        *,
+        message_id: str,
+        data: dict[str, Any],
+        chat: ChatRef,
+    ) -> ExpandedReply:
+        """根据 get_msg 数据构造 reply 展开结果。"""
+
+        sender_id, sender_name = self._extract_sender_identity(
+            data.get("sender"),
+            fallback_user_id=data.get("user_id"),
+        )
+        parsed = self._parse_detail_message(
+            message=data.get("message"),
+            raw_message=data.get("raw_message"),
+        )
+        text = parsed.cq_text or str(data.get("raw_message") or "").strip()
+        media_meta = list(getattr(parsed, "media_meta", None) or [])
+        return ExpandedReply(
+            id=message_id,
+            sender_name=sender_name,
+            sender_id=sender_id,
+            text=text,
+            forward=(
+                None
+                if not parsed.forward_id
+                else ExpandedForward(id=str(parsed.forward_id or "").strip())
+            ),
+            message=data.get("message"),
+            raw_message=data.get("raw_message"),
+            media_meta=media_meta,
+        )
+
+    def _build_forward_item_from_string(self, node: str) -> tuple[ForwardItemRecord, list[dict[str, Any]]]:
+        """把字符串 forward 节点构造成记录与媒体信息。"""
+
+        parsed = self._parse_detail_message(message=node, raw_message=node)
+        return (
+            ForwardItemRecord(
+                sender_name="unknown",
+                sender_id="",
+                message_id="",
+                text=self._truncate_detail_text(parsed.cq_text or str(node)),
+            ),
+            list(parsed.media_meta or []),
+        )
+
+    def _build_forward_item_from_dict(
+        self,
+        *,
+        node: dict[str, Any],
+        chat: ChatRef,
+    ) -> tuple[ForwardItemRecord, list[dict[str, Any]]]:
+        """把字典 forward 节点构造成记录与媒体信息。"""
+
+        sender_id, sender_name = self._extract_sender_identity(
+            node.get("sender"),
+            fallback_user_id=node.get("user_id"),
+        )
+        parsed = self._parse_detail_message(
+            message=node.get("message"),
+            raw_message=node.get("raw_message"),
+        )
+        return (
+            ForwardItemRecord(
+                sender_name=sender_name,
+                sender_id=sender_id,
+                message_id=str(node.get("message_id") or "").strip(),
+                text=self._truncate_detail_text(
+                    parsed.cq_text or str(node.get("raw_message") or "").strip()
+                ),
+                source=self._build_forward_source(chat=chat, group_id=node.get("group_id")),
+            ),
+            list(parsed.media_meta or []),
+        )
+
     async def expand_reply(self, *, message_id: str, chat: ChatRef) -> ExpandedReply:
         """展开引用消息（reply）。
 
@@ -1517,37 +1605,10 @@ class NapCatMessageDetailFetcher:
         if not isinstance(data, dict):
             return ExpandedReply(id=mid)
 
-        sender = data.get("sender")
-        if not isinstance(sender, dict):
-            sender = {}
-
-        uid = str(sender.get("user_id") or data.get("user_id") or "").strip()
-        u = str(sender.get("card") or sender.get("nickname") or uid or "unknown").strip()
-
-        parsed = self._parse_detail_message(
-            message=data.get("message"),
-            raw_message=data.get("raw_message"),
-        )
-        text = parsed.cq_text or str(data.get("raw_message") or "").strip()
-
-        # 额外：保留引用消息的原始 segments + 结构化 media_meta（便于下载引用消息图片）
-        media_meta = list(getattr(parsed, "media_meta", None) or [])
-
-        # 如果引用原消息里包含 forward，可提前展开引用 forward（后续可复用 forward_cache）
-        fw: Optional[ExpandedForward] = None
-        if parsed.forward_id:
-            fw = await self.expand_forward(forward_id=parsed.forward_id, chat=chat)
-
-        return ExpandedReply(
-            id=mid,
-            sender_name=u,
-            sender_id=uid,
-            text=text,
-            forward=fw,
-            message=data.get("message"),
-            raw_message=data.get("raw_message"),
-            media_meta=media_meta,
-        )
+        exp = self._build_expanded_reply(message_id=mid, data=data, chat=chat)
+        if getattr(getattr(exp, "forward", None), "id", ""):
+            exp.forward = await self.expand_forward(forward_id=exp.forward.id, chat=chat)
+        return exp
 
     async def expand_forward(self, *, forward_id: str, chat: ChatRef) -> ExpandedForward:
         """展开合并转发（forward）。
@@ -1583,46 +1644,13 @@ class NapCatMessageDetailFetcher:
         media_meta: list[dict[str, Any]] = []
         for node in nodes:
             if isinstance(node, str):
-                parsed = self._parse_detail_message(message=node, raw_message=node)
-                text = self._truncate_detail_text(parsed.cq_text or str(node))
-                items.append(
-                    ForwardItemRecord(
-                        sender_name="unknown",
-                        sender_id="",
-                        message_id="",
-                        text=text,
-                    )
-                )
-                if parsed.media_meta:
-                    media_meta.extend(list(parsed.media_meta))
+                item, node_media_meta = self._build_forward_item_from_string(node)
+            elif isinstance(node, dict):
+                item, node_media_meta = self._build_forward_item_from_dict(node=node, chat=chat)
+            else:
                 continue
-
-            if not isinstance(node, dict):
-                continue
-
-            sender = node.get("sender")
-            if not isinstance(sender, dict):
-                sender = {}
-            uid = str(node.get("user_id") or sender.get("user_id") or "").strip()
-            u = str(sender.get("card") or sender.get("nickname") or uid or "unknown").strip()
-            parsed = self._parse_detail_message(
-                message=node.get("message"),
-                raw_message=node.get("raw_message"),
-            )
-            text = self._truncate_detail_text(
-                parsed.cq_text or str(node.get("raw_message") or "").strip()
-            )
-            items.append(
-                ForwardItemRecord(
-                    sender_name=u,
-                    sender_id=uid,
-                    message_id=str(node.get("message_id") or "").strip(),
-                    text=text,
-                    source=self._build_forward_source(chat=chat, group_id=node.get("group_id")),
-                )
-            )
-            if parsed.media_meta:
-                media_meta.extend(list(parsed.media_meta))
+            items.append(item)
+            media_meta.extend(node_media_meta)
 
         summary = ""
         try:
