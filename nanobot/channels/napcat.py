@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import json
 import os
-import random
+import hashlib
 import re
 import time
 import uuid
@@ -227,6 +227,21 @@ def _reply_notice_message(sender_name: str) -> str:
         return f"[notice:poke] {sender_name} 戳了你"
     return "[notice:poke] 有人戳了你"
 
+
+def _stable_probability_sample(
+    *,
+    session_key: str,
+    message_id: str,
+    sender_id: str,
+    message_time: datetime,
+) -> float:
+    """基于消息身份生成稳定的 [0, 1) 采样值。"""
+    seed = (
+        f"{session_key}|{message_id}|{sender_id}|{message_time.timestamp():.6f}"
+    )
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    number = int.from_bytes(digest[:8], "big", signed=False)
+    return number / (2**64)
 
 
 def _summarize_event(payload: dict[str, Any]) -> str:
@@ -1868,7 +1883,6 @@ def check_trigger(
     enriched: EnrichedInbound,
     state: "SessionBufferState",
     config: NapCatConfig,
-    random_value: float,
     now_monotonic: float,
     last_poke_monotonic: dict[str, float],
     self_id: str,
@@ -1908,7 +1922,13 @@ def check_trigger(
         if inbound.chat.route == "private"
         else config.group_trigger_prob
     )
-    if random_value < probability:
+    sample = _stable_probability_sample(
+        session_key=state.chat.session_key,
+        message_id=inbound.message_id,
+        sender_id=inbound.sender_id,
+        message_time=inbound.time,
+    )
+    if sample < probability:
         return TriggerDecision(True, "probability")
 
     return TriggerDecision(False, "passive_record")
@@ -2708,7 +2728,6 @@ class EventPipeline:
         self._session_store = session_store
         self._serializer = serializer
         self._self_id_getter = self_id_getter
-        self._random = random.Random()
         self._last_poke_monotonic: dict[str, float] = {}
 
     async def handle(self, payload: dict[str, Any]) -> None:
@@ -2732,7 +2751,6 @@ class EventPipeline:
             enriched=enriched,
             state=state,
             config=self._config,
-            random_value=self._random.random(),
             now_monotonic=time.monotonic(),
             last_poke_monotonic=self._last_poke_monotonic,
             self_id=self._self_id_getter(),
