@@ -2650,6 +2650,13 @@ class OutboundSender:
         if self._should_suppress_outbound(msg):
             logger.debug("NapCat [SEND] suppressed empty reply chat_id={}", msg.chat_id)
             return
+        if self._should_suppress_llm_connection_error(msg):
+            logger.warning(
+                "NapCat [SEND] suppressed LLM connection error chat_id={} preview={!r}",
+                msg.chat_id,
+                _coerce_str(msg.content).strip()[:160],
+            )
+            return
 
         try:
             route, target_id = _parse_internal_chat_id(msg.chat_id)
@@ -2704,6 +2711,19 @@ class OutboundSender:
 
         content = _coerce_str(msg.content).strip()
         return content in {"", _AGENT_EMPTY_RESPONSE_FALLBACK}
+
+    @staticmethod
+    def _should_suppress_llm_connection_error(msg: OutboundMessage) -> bool:
+        """拦截底层 LLM 连接错误，避免将内部异常直接发到聊天侧。"""
+        if msg.media:
+            return False
+
+        content = _coerce_str(msg.content).strip()
+        if not content.startswith("Error calling LLM:"):
+            return False
+
+        lowered = content.lower()
+        return "connection error" in lowered
 
     def _compose_outbound_content(
         self,
