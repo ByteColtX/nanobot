@@ -48,6 +48,7 @@ _REQUEST_TIMEOUT_SECONDS = 20.0
 _RECONNECT_BASE_SECONDS = 1.0
 _RECONNECT_MAX_SECONDS = 30.0
 _KEEPALIVE_PING_SECONDS = 20
+_AGENT_EMPTY_RESPONSE_FALLBACK = "I've completed processing but have no response to give."
 
 
 def _json_dumps_compact(data: Any) -> str:
@@ -95,12 +96,20 @@ def _ensure_list(value: Any) -> list[Any]:
     return []
 
 
-def _normalize_id_list(values: list[str] | None) -> frozenset[str]:
-    """将 ID 列表归一化为去重集合。"""
-    if not values:
+def _normalize_id_list(values: Any) -> frozenset[str]:
+    """将单值或列表形式的 ID 配置归一化为去重集合。"""
+    if values is None:
         return frozenset()
+
+    if isinstance(values, str):
+        items: tuple[Any, ...] | list[Any] | set[Any] | frozenset[Any] = (values,)
+    elif isinstance(values, (list, tuple, set, frozenset)):
+        items = values
+    else:
+        items = (values,)
+
     return frozenset(
-        item for item in (_coerce_str(value).strip() for value in values) if item
+        item for item in (_coerce_str(value).strip() for value in items) if item
     )
 
 
@@ -2567,6 +2576,9 @@ class OutboundSender:
 
     async def send(self, msg: OutboundMessage) -> None:
         """发送一条 nanobot 出站消息。"""
+        if self._should_suppress_outbound(msg):
+            return
+
         try:
             route, target_id = _parse_internal_chat_id(msg.chat_id)
         except ValueError:
@@ -2605,6 +2617,15 @@ class OutboundSender:
                 sender_name=self._self_name_getter() or self._self_id_getter() or "bot",
                 session_key=_coerce_optional_str(msg.metadata.get("napcat_session_key")),
             )
+
+    @staticmethod
+    def _should_suppress_outbound(msg: OutboundMessage) -> bool:
+        """拦截 agent 空回复在 NapCat 侧的兜底发送。"""
+        if msg.media:
+            return False
+
+        content = _coerce_str(msg.content).strip()
+        return content in {"", _AGENT_EMPTY_RESPONSE_FALLBACK}
 
     def _compose_outbound_content(
         self,
