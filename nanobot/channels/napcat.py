@@ -837,6 +837,10 @@ class EventRouter:
         self._pipeline = pipeline
         self._workers: dict[str, SessionWorker] = {}
 
+    def _remove_worker(self, session_key: str) -> None:
+        """移除一个已结束的 session worker。"""
+        self._workers.pop(session_key, None)
+
     async def route(self, payload: dict[str, Any]) -> None:
         """路由事件到对应 session 的串行 Worker。"""
         session_key = extract_session_key(payload, self._self_id_getter())
@@ -854,7 +858,7 @@ class EventRouter:
                 session_key=session_key,
                 ttl_seconds=self._config.session_idle_ttl_s,
                 handler=self._pipeline.handle,
-                on_closed=lambda key: self._workers.pop(key, None),
+                on_closed=self._remove_worker,
             )
             self._workers[session_key] = worker
 
