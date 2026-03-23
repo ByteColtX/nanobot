@@ -43,6 +43,11 @@ _VIDEO_EXTENSIONS = frozenset(
     {".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv"}
 )
 _INVALID_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._\-]+")
+_IDENTITY_INIT_TIMEOUT_SECONDS = 3.0
+_REQUEST_TIMEOUT_SECONDS = 20.0
+_RECONNECT_BASE_SECONDS = 1.0
+_RECONNECT_MAX_SECONDS = 30.0
+_KEEPALIVE_PING_SECONDS = 20
 
 
 def _json_dumps_compact(data: Any) -> str:
@@ -89,6 +94,12 @@ def _ensure_list(value: Any) -> list[Any]:
         return value
     return []
 
+
+def _normalize_id_list(values: list[str] | None) -> set[str]:
+    """将 ID 列表归一化为去重集合。"""
+    if not values:
+        return set()
+    return {item for item in (_coerce_str(value).strip() for value in values) if item}
 
 
 def _truncate_text(text: str, max_chars: int) -> str:
@@ -266,6 +277,7 @@ class NapCatConfig(Base):
     # nanobot 的 ChannelManager 会在 allow_from == [] 时直接退出进程，
     # 因此这里默认使用 ["*"]，以保持新 channel 安装后的“可启动”行为。
     allow_from: list[str] = Field(default_factory=lambda: ["*"])
+    super_admins: list[str] = Field(default_factory=list)
     blacklist_private_ids: list[str] = Field(default_factory=list)
     blacklist_group_ids: list[str] = Field(default_factory=list)
 
@@ -283,24 +295,12 @@ class NapCatConfig(Base):
     session_idle_ttl_s: int = Field(default=3600, ge=60)
     ignore_self_messages: bool = True
 
-    cold_start_history: bool = True
-
     media_dir: str = ""
     media_download_timeout: int = Field(default=30, ge=1)
     media_max_size_mb: int = Field(default=50, ge=1)
 
     friend_cache_ttl_s: int = Field(default=600, ge=60)
     group_member_cache_ttl_s: int = Field(default=600, ge=60)
-    identity_init_timeout_s: float = Field(default=3.0, gt=0)
-
-    rate_limit_per_session: int = Field(default=0, ge=0)
-    rate_limit_window_s: int = Field(default=60, ge=1)
-
-    request_timeout_seconds: int = Field(default=20, ge=1)
-    reconnect_base_seconds: float = Field(default=1.0, gt=0)
-    reconnect_max_seconds: float = Field(default=30.0, ge=1.0)
-    keepalive_ping_seconds: int = Field(default=20, ge=5)
-    reply_to_message: bool = True
 
 
 # ==============================
@@ -530,7 +530,7 @@ class NapCatTransport:
     async def start(self) -> None:
         """启动 WebSocket 长连接与自动重连循环。"""
         self._running = True
-        delay = self._config.reconnect_base_seconds
+        delay = _RECONNECT_BASE_SECONDS
         url = _normalize_ws_url(self._config.url)
         headers: dict[str, str] = {}
         if self._config.token:
@@ -542,8 +542,8 @@ class NapCatTransport:
                 async with websockets.connect(
                     url,
                     additional_headers=headers or None,
-                    ping_interval=self._config.keepalive_ping_seconds,
-                    open_timeout=self._config.request_timeout_seconds,
+                    ping_interval=_KEEPALIVE_PING_SECONDS,
+                    open_timeout=_REQUEST_TIMEOUT_SECONDS,
                     close_timeout=5,
                     max_size=None,
                 ) as websocket:
@@ -551,7 +551,7 @@ class NapCatTransport:
                     self._connected.set()
                     self._connection_seq += 1
                     connection_id = self._connection_seq
-                    delay = self._config.reconnect_base_seconds
+                    delay = _RECONNECT_BASE_SECONDS
                     logger.info("NapCat 连接已建立，connection_id={}", connection_id)
 
                     self._recv_task = asyncio.create_task(self._recv_loop())
@@ -575,7 +575,7 @@ class NapCatTransport:
                     exc,
                 )
                 await asyncio.sleep(delay)
-                delay = min(delay * 2, self._config.reconnect_max_seconds)
+                delay = min(delay * 2, _RECONNECT_MAX_SECONDS)
             finally:
                 self._connected.clear()
                 if self._recv_task is not None:
@@ -617,7 +617,7 @@ class NapCatTransport:
         if not self._running:
             raise NapCatTransportError("NapCat 传输层尚未启动")
 
-        effective_timeout = timeout or float(self._config.request_timeout_seconds)
+        effective_timeout = timeout or _REQUEST_TIMEOUT_SECONDS
         await asyncio.wait_for(self._connected.wait(), timeout=effective_timeout)
 
         if self._ws is None:
@@ -1789,23 +1789,16 @@ def check_trigger(
     if _is_exact_supported_command(text):
         return TriggerDecision(True, "slash_command")
 
-    if state.hit_rate_limit(now_monotonic):
-        return TriggerDecision(False, "rate_limited")
-
     if inbound.is_notice:
-        decision = decide_notice_trigger(
+        return decide_notice_trigger(
             enriched=enriched,
             config=config,
             last_poke_monotonic=last_poke_monotonic,
             now_monotonic=now_monotonic,
             self_id=self_id,
         )
-        if decision.should_reply:
-            state.record_rate_hit(now_monotonic)
-        return decision
 
     if config.trigger_on_at and inbound.at_self:
-        state.record_rate_hit(now_monotonic)
         return TriggerDecision(True, "at_self")
 
     if (
@@ -1813,12 +1806,10 @@ def check_trigger(
         and inbound.reply_id
         and state.is_bot_message(inbound.reply_id)
     ):
-        state.record_rate_hit(now_monotonic)
         return TriggerDecision(True, "reply_to_bot")
 
     lowered_text = text.lower()
     if any(trigger.lower() in lowered_text for trigger in config.nickname_triggers):
-        state.record_rate_hit(now_monotonic)
         return TriggerDecision(True, "nickname_trigger")
 
     probability = (
@@ -1827,7 +1818,6 @@ def check_trigger(
         else config.group_trigger_prob
     )
     if random_value < probability:
-        state.record_rate_hit(now_monotonic)
         return TriggerDecision(True, "probability")
 
     return TriggerDecision(False, "passive_record")
@@ -1844,15 +1834,12 @@ class SessionBufferState:
 
     chat: ChatRef
     buffer_size: int
-    rate_limit_per_session: int
-    rate_limit_window_s: int
     records: list[ContextMessageRecord] = field(default_factory=list)
     last_sent_cursor: int = 0
     bot_message_ids: deque[str] = field(default_factory=deque)
     message_ids: deque[str] = field(default_factory=deque)
     _message_id_set: set[str] = field(default_factory=set)
     _bot_message_id_set: set[str] = field(default_factory=set)
-    _rate_hits: deque[float] = field(default_factory=deque)
 
     def contains_message_id(self, message_id: str) -> bool:
         """判断消息是否已存在于缓冲。"""
@@ -1870,6 +1857,8 @@ class SessionBufferState:
         self.records.append(record)
         self.message_ids.append(record.message_id)
         self._message_id_set.add(record.message_id)
+        if record.role == "assistant" and record.message_id:
+            self._register_bot_message_id(record.message_id)
         self._trim_if_needed()
 
     def get_unsent_records(self) -> list[ContextMessageRecord]:
@@ -1894,8 +1883,6 @@ class SessionBufferState:
         if not message_id:
             return
 
-        self.bot_message_ids.append(message_id)
-        self._bot_message_id_set.add(message_id)
         record = ContextMessageRecord(
             message_id=message_id,
             role="assistant",
@@ -1906,10 +1893,7 @@ class SessionBufferState:
             time=datetime.now(timezone.utc),
             body_tokens=[BodyToken(kind="text", text=text)] if text else [],
         )
-        self.records.append(record)
-        self.message_ids.append(message_id)
-        self._message_id_set.add(message_id)
-        self._trim_if_needed()
+        self.append(record)
         # 机器人自己的输出已经被上游 Agent 看到，不应再次作为“未发送窗口”。
         self.mark_sent_to_end()
 
@@ -1921,28 +1905,13 @@ class SessionBufferState:
         self.message_ids.clear()
         self._message_id_set.clear()
         self._bot_message_id_set.clear()
-        self._rate_hits.clear()
 
-    def hit_rate_limit(self, now_monotonic: float) -> bool:
-        """检查当前 session 是否触发频率限制。"""
-        if self.rate_limit_per_session <= 0:
-            return False
-
-        self._evict_old_rate_hits(now_monotonic)
-        return len(self._rate_hits) >= self.rate_limit_per_session
-
-    def record_rate_hit(self, now_monotonic: float) -> None:
-        """记录一次触发命中。"""
-        if self.rate_limit_per_session <= 0:
+    def _register_bot_message_id(self, message_id: str) -> None:
+        """记录一条机器人消息 ID。"""
+        if not message_id or message_id in self._bot_message_id_set:
             return
-        self._evict_old_rate_hits(now_monotonic)
-        self._rate_hits.append(now_monotonic)
-
-    def _evict_old_rate_hits(self, now_monotonic: float) -> None:
-        """清理窗口外的频率计数。"""
-        window = float(self.rate_limit_window_s)
-        while self._rate_hits and now_monotonic - self._rate_hits[0] > window:
-            self._rate_hits.popleft()
+        self.bot_message_ids.append(message_id)
+        self._bot_message_id_set.add(message_id)
 
     def _trim_if_needed(self) -> None:
         """按 session_buffer_size 修剪缓冲。"""
@@ -1981,8 +1950,6 @@ class SessionBufferStore:
         state = SessionBufferState(
             chat=chat,
             buffer_size=self._config.session_buffer_size,
-            rate_limit_per_session=self._config.rate_limit_per_session,
-            rate_limit_window_s=self._config.rate_limit_window_s,
         )
         self._states[chat.session_key] = state
         return state
@@ -2058,6 +2025,56 @@ class SessionBufferStore:
             if state.chat.chat_id == chat_id:
                 return state
         return None
+
+    def render_debug_table(self) -> str:
+        """渲染当前 session 缓冲的简表，便于运行时排查。"""
+        states = sorted(self._states.values(), key=lambda item: item.chat.session_key)
+        if not states:
+            return "(empty)"
+
+        headers = (
+            "session_key",
+            "route",
+            "records",
+            "unsent",
+            "cursor",
+            "bot_ids",
+            "last_message_id",
+        )
+        rows: list[tuple[str, ...]] = []
+        for state in states:
+            last_message_id = state.records[-1].message_id if state.records else ""
+            rows.append(
+                (
+                    state.chat.session_key,
+                    state.chat.route,
+                    str(len(state.records)),
+                    str(len(state.get_unsent_records())),
+                    str(state.last_sent_cursor),
+                    str(len(state.bot_message_ids)),
+                    last_message_id,
+                )
+            )
+
+        widths = [
+            max(len(header), *(len(row[index]) for row in rows))
+            for index, header in enumerate(headers)
+        ]
+
+        def _format_row(values: tuple[str, ...]) -> str:
+            return " | ".join(
+                value.ljust(widths[index])
+                for index, value in enumerate(values)
+            )
+
+        divider = "-+-".join("-" * width for width in widths)
+        return "\n".join(
+            [
+                _format_row(headers),
+                divider,
+                *(_format_row(row) for row in rows),
+            ]
+        )
 
 
 # ==============================
@@ -2455,14 +2472,12 @@ class OutboundSender:
 
     def __init__(
         self,
-        config: NapCatConfig,
         transport: NapCatTransport,
         session_store: SessionBufferStore,
         self_id_getter: Callable[[], str],
         self_name_getter: Callable[[], str],
     ):
         """初始化出站发送器。"""
-        self._config = config
         self._transport = transport
         self._session_store = session_store
         self._self_id_getter = self_id_getter
@@ -2476,15 +2491,10 @@ class OutboundSender:
             logger.error("NapCat send 收到非法 chat_id: {}", msg.chat_id)
             return
 
-        reply_to = (
-            _coerce_optional_str(msg.reply_to)
-            or _coerce_optional_str(msg.metadata.get("message_id"))
-        )
         is_progress = bool(msg.metadata.get("_progress"))
         content = self._compose_outbound_content(
             content=msg.content,
             media=msg.media,
-            reply_to=reply_to if (self._config.reply_to_message and not is_progress) else None,
         )
 
         params: dict[str, Any]
@@ -2518,13 +2528,9 @@ class OutboundSender:
         self,
         content: str,
         media: list[str],
-        reply_to: str | None,
     ) -> str:
         """构造最终发给 NapCat 的消息内容。"""
         pieces: list[str] = []
-        if reply_to:
-            pieces.append(f"[CQ:reply,id={reply_to}]")
-
         if content:
             pieces.append(content)
 
@@ -2578,141 +2584,6 @@ def _record_from_enriched(enriched: EnrichedInbound) -> ContextMessageRecord:
     )
 
 
-class ColdStartFetcher:
-    """冷启动历史拉取器。"""
-
-    def __init__(
-        self,
-        config: NapCatConfig,
-        transport: NapCatTransport,
-        session_store: SessionBufferStore,
-        normalizer: NapCatNormalizer,
-    ):
-        """初始化冷启动拉取器。"""
-        self._config = config
-        self._transport = transport
-        self._session_store = session_store
-        self._normalizer = normalizer
-        self._task: asyncio.Task[None] | None = None
-        self._connection_id = 0
-
-    def schedule(self, connection_id: int) -> None:
-        """按当前连接调度冷启动补拉任务。"""
-        if not self._config.cold_start_history:
-            return
-
-        self._connection_id = connection_id
-        if self._task is not None and not self._task.done():
-            self._task.cancel()
-        self._task = asyncio.create_task(self._run(connection_id))
-
-    async def stop(self) -> None:
-        """停止冷启动任务。"""
-        if self._task is None:
-            return
-        self._task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await self._task
-
-    async def _run(self, connection_id: int) -> None:
-        """执行一次历史补拉。"""
-        states = self._session_store.list_states()
-        if not states:
-            logger.debug("NapCat 冷启动跳过：当前没有已知 session")
-            return
-
-        logger.info("NapCat 开始冷启动补拉，共 {} 个 session", len(states))
-        for state in states:
-            if connection_id != self._connection_id:
-                logger.debug("NapCat 冷启动任务已过期，停止执行")
-                return
-            try:
-                await self._fill_state(state)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception(
-                    "NapCat 冷启动补拉失败，session_key={}",
-                    state.chat.session_key,
-                )
-
-    async def _fill_state(self, state: SessionBufferState) -> None:
-        """为单个 session 拉取历史并写入缓冲。"""
-        if state.chat.session_key.startswith("napcat:pt:"):
-            logger.debug(
-                "NapCat 冷启动跳过临时私聊 session，因公开历史接口缺少 target_id 过滤: {}",
-                state.chat.session_key,
-            )
-            return
-
-        if state.chat.route == "group":
-            action = "get_group_msg_history"
-            params = {
-                "group_id": state.chat.group_id,
-                "count": self._config.context_max_messages,
-            }
-        else:
-            action = "get_friend_msg_history"
-            params = {
-                "user_id": state.chat.user_id,
-                "count": self._config.context_max_messages,
-            }
-
-        response = await self._transport.call_action(action, params)
-        messages = self._extract_history_messages(response)
-        if not messages:
-            return
-
-        normalized_items: list[NormalizedInbound] = []
-        for item in messages:
-            normalized = self._normalizer.normalize_message_object(item)
-            if normalized is None:
-                continue
-            if normalized.chat.session_key != state.chat.session_key:
-                continue
-            normalized_items.append(normalized)
-
-        normalized_items.sort(key=lambda item: item.time)
-        for normalized in normalized_items:
-            if self._session_store.contains_message_id(
-                normalized.chat.session_key,
-                normalized.message_id,
-            ):
-                continue
-            self._session_store.append_record(
-                normalized.chat,
-                ContextMessageRecord(
-                    message_id=normalized.message_id,
-                    role="user",
-                    sender_id=normalized.sender_id,
-                    sender_name=normalized.sender_name,
-                    text=normalized.text,
-                    raw_message=normalized.raw_message,
-                    time=normalized.time,
-                    body_tokens=normalized.body_tokens,
-                    at_self=normalized.at_self,
-                    reply_id=normalized.reply_id,
-                    media_paths=[],
-                    is_notice=normalized.is_notice,
-                    notice_name=normalized.notice_name,
-                ),
-            )
-
-        # 冷启动写入的历史不应被当作“新增待发送窗口”。
-        state.mark_sent_to_end()
-
-    @staticmethod
-    def _extract_history_messages(response: dict[str, Any]) -> list[dict[str, Any]]:
-        """从历史接口响应中提取消息数组。"""
-        data = response.get("data")
-        if isinstance(data, dict) and isinstance(data.get("messages"), list):
-            return [item for item in data["messages"] if isinstance(item, dict)]
-        if isinstance(response.get("messages"), list):
-            return [item for item in response["messages"] if isinstance(item, dict)]
-        logger.warning("NapCat 历史响应缺少 messages 字段: {}", response)
-        return []
-
-
 class EventPipeline:
     """NapCat 事件处理编排器。"""
 
@@ -2745,13 +2616,15 @@ class EventPipeline:
 
         command = normalized.text.strip().lower()
         if _is_exact_supported_command(command):
+            if normalized.sender_id not in _normalize_id_list(self._config.super_admins):
+                return
             await self._publish_command(normalized)
             if command == "/new":
                 self._session_store.clear(normalized.chat.session_key)
             return
 
-        enriched = await self._enricher.enrich(normalized)
         state = self._session_store.get_or_create(normalized.chat)
+        enriched = await self._enricher.enrich(normalized)
         decision = check_trigger(
             enriched=enriched,
             state=state,
@@ -2806,6 +2679,12 @@ class EventPipeline:
 
     async def _publish_command(self, normalized: NormalizedInbound) -> None:
         """直接向上游发布原生命令，不经过 CQMSG 封装。"""
+        if normalized.text.strip().lower() == "/status":
+            logger.info(
+                "NapCat SessionBuffer cache table:\n{}",
+                self._session_store.render_debug_table(),
+            )
+
         metadata = {
             "message_id": normalized.message_id,
             "napcat_route": normalized.chat.route,
@@ -2857,7 +2736,7 @@ class NapCatChannel(BaseChannel):
 
         self._self_id = ""
         self._self_name = ""
-        self._bootstrap_task: asyncio.Task[None] | None = None
+        self._identity_task: asyncio.Task[None] | None = None
 
         self._session_store = SessionBufferStore(self.config)
         self._parser = NapCatMessageParser(self._get_self_id)
@@ -2901,14 +2780,7 @@ class NapCatChannel(BaseChannel):
             self_id_getter=self._get_self_id,
             pipeline=self._pipeline,
         )
-        self._cold_start = ColdStartFetcher(
-            config=self.config,
-            transport=self._transport,
-            session_store=self._session_store,
-            normalizer=self._normalizer,
-        )
         self._outbound = OutboundSender(
-            config=self.config,
             transport=self._transport,
             session_store=self._session_store,
             self_id_getter=self._get_self_id,
@@ -2932,12 +2804,11 @@ class NapCatChannel(BaseChannel):
     async def stop(self) -> None:
         """停止 NapCat Channel。"""
         self._running = False
-        if self._bootstrap_task is not None:
-            self._bootstrap_task.cancel()
+        if self._identity_task is not None:
+            self._identity_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await self._bootstrap_task
-            self._bootstrap_task = None
-        await self._cold_start.stop()
+                await self._identity_task
+            self._identity_task = None
         await self._router.stop()
         await self._transport.stop()
 
@@ -2947,18 +2818,19 @@ class NapCatChannel(BaseChannel):
 
     async def _on_transport_connected(self, connection_id: int) -> None:
         """处理 NapCat 建连后的初始化逻辑。"""
-        if self._bootstrap_task is not None and not self._bootstrap_task.done():
-            self._bootstrap_task.cancel()
+        del connection_id
+        if self._identity_task is not None and not self._identity_task.done():
+            self._identity_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await self._bootstrap_task
-        self._bootstrap_task = asyncio.create_task(
-            self._bootstrap_connection(connection_id)
+                await self._identity_task
+        self._identity_task = asyncio.create_task(
+            self._refresh_login_identity()
         )
 
-    async def _bootstrap_connection(self, connection_id: int) -> None:
-        """执行建连后的身份与冷启动初始化。"""
+    async def _refresh_login_identity(self) -> None:
+        """执行建连后的身份初始化。"""
         try:
-            timeout_at = time.monotonic() + float(self.config.identity_init_timeout_s)
+            timeout_at = time.monotonic() + _IDENTITY_INIT_TIMEOUT_SECONDS
             while not self._self_id and time.monotonic() < timeout_at:
                 await asyncio.sleep(0.05)
 
@@ -2969,8 +2841,6 @@ class NapCatChannel(BaseChannel):
             raise
         except Exception:
             logger.exception("NapCat 获取登录信息失败")
-        finally:
-            self._cold_start.schedule(connection_id)
 
     async def _on_transport_event(self, payload: dict[str, Any]) -> None:
         """处理 NapCat 上报事件。"""
