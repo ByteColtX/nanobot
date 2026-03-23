@@ -95,11 +95,13 @@ def _ensure_list(value: Any) -> list[Any]:
     return []
 
 
-def _normalize_id_list(values: list[str] | None) -> set[str]:
+def _normalize_id_list(values: list[str] | None) -> frozenset[str]:
     """将 ID 列表归一化为去重集合。"""
     if not values:
-        return set()
-    return {item for item in (_coerce_str(value).strip() for value in values) if item}
+        return frozenset()
+    return frozenset(
+        item for item in (_coerce_str(value).strip() for value in values) if item
+    )
 
 
 def _truncate_text(text: str, max_chars: int) -> str:
@@ -1689,73 +1691,139 @@ def extract_session_key(payload: dict[str, Any], self_id: str) -> str | None:
     return None
 
 
+@dataclass(slots=True, frozen=True)
+class _EventCtx:
+    """来源判断所需的最小不可变事件上下文。"""
+
+    post_type: str
+    message_type: str
+    user_id: str
+    source_group_id: str | None
+
+    @property
+    def has_group(self) -> bool:
+        """当前事件是否存在群来源。"""
+        return self.source_group_id is not None
+
+
+def _resolve_source_group_id(
+    payload: dict[str, Any],
+    post_type: str,
+    message_type: str,
+) -> str | None:
+    """群消息、群通知取 `group_id`；群临时私聊取 `target_id`。"""
+    if post_type == "notice" or message_type == "group":
+        return _coerce_optional_str(payload.get("group_id"))
+    if message_type == "private":
+        sub_type = _coerce_str(payload.get("sub_type")).strip().lower()
+        if sub_type == "group":
+            return _coerce_optional_str(payload.get("target_id"))
+    return None
+
+
+def _build_event_ctx(payload: dict[str, Any]) -> _EventCtx:
+    """将原始载荷解析为来源判断所需的上下文。"""
+    post_type = _coerce_str(payload.get("post_type")).strip().lower()
+    message_type = _coerce_str(payload.get("message_type")).strip().lower()
+    user_id = (
+        _coerce_optional_str(payload.get("user_id"))
+        or _coerce_optional_str(payload.get("sender_id"))
+        or ""
+    )
+    return _EventCtx(
+        post_type=post_type,
+        message_type=message_type,
+        user_id=user_id,
+        source_group_id=_resolve_source_group_id(payload, post_type, message_type),
+    )
+
+
+def _is_blacklisted(
+    ctx: _EventCtx,
+    blacklist_group_ids: frozenset[str],
+    blacklist_private_ids: frozenset[str],
+) -> bool:
+    """群来源查群黑名单，纯私聊查私聊黑名单。"""
+    if ctx.has_group:
+        return bool(ctx.source_group_id and ctx.source_group_id in blacklist_group_ids)
+    return bool(ctx.user_id) and ctx.user_id in blacklist_private_ids
+
+
+def _is_allowed(
+    ctx: _EventCtx,
+    allow_ids: frozenset[str],
+) -> bool:
+    """按来源会话检查 `allow_from`。"""
+    if "*" in allow_ids:
+        return True
+    if ctx.has_group:
+        return bool(ctx.source_group_id and ctx.source_group_id in allow_ids)
+    return ctx.user_id in allow_ids
+
+
+def _check_notice(
+    payload: dict[str, Any],
+    ctx: _EventCtx,
+    allow_ids: frozenset[str],
+    self_id: str,
+) -> bool:
+    """通知事件只放行发给自己的 poke，随后再过 allow_from。"""
+    notice_type = _coerce_str(payload.get("notice_type")).strip().lower()
+    sub_type = _coerce_str(payload.get("sub_type")).strip().lower()
+    is_poke = (notice_type == "notify" and sub_type == "poke") or notice_type == "poke"
+    if not is_poke:
+        return False
+
+    target_id = _coerce_optional_str(payload.get("target_id"))
+    if self_id and target_id and target_id != self_id:
+        return False
+
+    return _is_allowed(ctx, allow_ids)
+
 
 def check_source_gate(
     payload: dict[str, Any],
     config: NapCatConfig,
     self_id: str,
 ) -> bool:
-    """检查事件来源是否允许进入后续处理。"""
-    def _extract_source_group_id() -> str | None:
-        if post_type == "notice":
-            return _coerce_optional_str(payload.get("group_id"))
-        if message_type == "group":
-            return _coerce_optional_str(payload.get("group_id"))
-        if message_type != "private":
-            return None
-        sub_type = _coerce_str(payload.get("sub_type")).strip().lower()
-        if sub_type != "group":
-            return None
-        return _coerce_optional_str(payload.get("target_id"))
+    """检查事件来源是否允许进入后续处理。
 
-    post_type = _coerce_str(payload.get("post_type")).strip().lower()
-    user_id = (
-        _coerce_optional_str(payload.get("user_id"))
-        or _coerce_optional_str(payload.get("sender_id"))
-        or ""
-    )
-    message_type = _coerce_str(payload.get("message_type")).strip().lower()
+    编排顺序：
+    1. 先把 payload 解析成不可变上下文。
+    2. 黑名单优先，命中即拒。
+    3. 再处理 `message_sent` / 自身消息过滤。
+    4. notice 只放行发给自己的 poke，并继续走 allow_from。
+    5. 普通消息最后按来源会话检查 allow_from。
+
+    授权语义：
+    - 群消息、群通知、群临时私聊都按“来源群 ID”授权。
+    - 普通私聊按“来源用户 ID”授权。
+    - `allow_from` 不能覆盖黑名单。
+    """
+    ctx = _build_event_ctx(payload)
+
     allow_ids = _normalize_id_list(config.allow_from)
     blacklist_private_ids = _normalize_id_list(config.blacklist_private_ids)
     blacklist_group_ids = _normalize_id_list(config.blacklist_group_ids)
-    source_group_id = _extract_source_group_id()
-    has_group_source = bool(source_group_id)
 
-    # 来源会话中的群黑名单优先，包括群消息、群通知和群临时私聊。
-    if source_group_id and source_group_id in blacklist_group_ids:
-        return False
-    # 没有群来源时，按私聊来源处理，私聊黑名单同样优先于 allow_from。
-    if not has_group_source and user_id and user_id in blacklist_private_ids:
+    if _is_blacklisted(ctx, blacklist_group_ids, blacklist_private_ids):
         return False
 
-    if post_type == "message_sent":
+    if ctx.post_type == "message_sent":
         return not config.ignore_self_messages
 
-    if config.ignore_self_messages and self_id and user_id == self_id:
+    if config.ignore_self_messages and self_id and ctx.user_id == self_id:
         return False
 
-    if post_type == "notice":
-        notice_type = _coerce_str(payload.get("notice_type")).strip().lower()
-        sub_type = _coerce_str(payload.get("sub_type")).strip().lower()
-        is_poke = (
-            (notice_type == "notify" and sub_type == "poke")
-            or notice_type == "poke"
-        )
-        if not is_poke:
-            return False
-        target_id = _coerce_optional_str(payload.get("target_id"))
-        if self_id and target_id and target_id != self_id:
-            return False
-        if "*" not in allow_ids and user_id not in allow_ids:
-            return False
-        return True
+    if ctx.post_type == "notice":
+        return _check_notice(payload, ctx, allow_ids, self_id)
 
-    if message_type not in {"group", "private"}:
+    if ctx.message_type not in {"group", "private"}:
+        return False
+    if ctx.message_type == "group" and not ctx.has_group:
         return False
 
-    if "*" in allow_ids:
-        return True
-    return user_id in allow_ids
+    return _is_allowed(ctx, allow_ids)
 
 
 
