@@ -19,7 +19,7 @@ import websockets
 from loguru import logger
 from pydantic import Field
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Base
@@ -2857,7 +2857,7 @@ class EventPipeline:
         if normalized.chat.session_key != default_session_key:
             session_key_override = normalized.chat.session_key
 
-        await self._channel._handle_message(
+        await self._channel._publish_inbound_message(
             sender_id=normalized.sender_id,
             chat_id=normalized.chat.chat_id,
             content=content,
@@ -2890,7 +2890,7 @@ class EventPipeline:
         if normalized.chat.session_key != default_session_key:
             session_key_override = normalized.chat.session_key
 
-        await self._channel._handle_message(
+        await self._channel._publish_inbound_message(
             sender_id=normalized.sender_id,
             chat_id=normalized.chat.chat_id,
             content=normalized.text.strip(),
@@ -3005,6 +3005,33 @@ class NapCatChannel(BaseChannel):
     async def send(self, msg: OutboundMessage) -> None:
         """通过 NapCat 发送一条消息。"""
         await self._outbound.send(msg)
+
+    async def _publish_inbound_message(
+        self,
+        *,
+        sender_id: str,
+        chat_id: str,
+        content: str,
+        media: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        session_key: str | None = None,
+    ) -> None:
+        """直接发布入站消息，避免 BaseChannel 再按 sender_id 重判权限。"""
+        meta = metadata or {}
+        if self.supports_streaming:
+            meta = {**meta, "_wants_stream": True}
+
+        msg = InboundMessage(
+            channel=self.name,
+            sender_id=str(sender_id),
+            chat_id=str(chat_id),
+            content=content,
+            media=media or [],
+            metadata=meta,
+            session_key_override=session_key,
+        )
+
+        await self.bus.publish_inbound(msg)
 
     async def _on_transport_connected(self) -> None:
         """处理 NapCat 建连后的初始化逻辑。"""
