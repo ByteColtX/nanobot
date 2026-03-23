@@ -516,6 +516,12 @@ class TriggerDecision:
 
     should_reply: bool
     reason: str
+    detail: str | None = None
+
+
+def _format_trigger_detail(decision: TriggerDecision) -> str:
+    """格式化触发细节，保持日志字段结构稳定。"""
+    return decision.detail or "-"
 
 
 # ==============================
@@ -538,7 +544,7 @@ class NapCatTransport:
         self,
         config: NapCatConfig,
         on_event: Callable[[dict[str, Any]], Awaitable[None]],
-        on_connected: Callable[[int], Awaitable[None]] | None = None,
+        on_connected: Callable[[], Awaitable[None]] | None = None,
     ):
         """初始化传输层。"""
         self._config = config
@@ -547,7 +553,6 @@ class NapCatTransport:
 
         self._ws: Any | None = None
         self._running = False
-        self._connection_seq = 0
         self._send_lock = asyncio.Lock()
         self._connected = asyncio.Event()
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
@@ -564,7 +569,7 @@ class NapCatTransport:
 
         while self._running:
             try:
-                logger.info("NapCat 正在连接: {}", url)
+                logger.info("NapCat [CONN] connecting url={}", url)
                 async with websockets.connect(
                     url,
                     additional_headers=headers or None,
@@ -575,19 +580,17 @@ class NapCatTransport:
                 ) as websocket:
                     self._ws = websocket
                     self._connected.set()
-                    self._connection_seq += 1
-                    connection_id = self._connection_seq
                     delay = _RECONNECT_BASE_SECONDS
-                    logger.info("NapCat 连接已建立，connection_id={}", connection_id)
+                    logger.info("NapCat [CONN] connected")
 
                     self._recv_task = asyncio.create_task(self._recv_loop())
                     if self._on_connected is not None:
                         try:
-                            await self._on_connected(connection_id)
+                            await self._on_connected()
                         except asyncio.CancelledError:
                             raise
                         except Exception:
-                            logger.exception("NapCat 建连回调执行失败")
+                            logger.exception("NapCat [CONN] on_connected callback failed")
 
                     await self._recv_task
             except asyncio.CancelledError:
@@ -596,7 +599,7 @@ class NapCatTransport:
                 if not self._running:
                     break
                 logger.warning(
-                    "NapCat 连接异常，将在 {:.1f}s 后重试: {}",
+                    "NapCat [CONN] connect failed retry_in_s={:.1f} error={}",
                     delay,
                     exc,
                 )
@@ -629,7 +632,7 @@ class NapCatTransport:
             try:
                 await self._ws.close()
             except Exception:
-                logger.debug("NapCat WebSocket 关闭时出现可忽略异常", exc_info=True)
+                logger.debug("NapCat [CONN] websocket close raised ignored exception", exc_info=True)
             finally:
                 self._ws = None
 
@@ -690,6 +693,8 @@ class NapCatTransport:
                     await self._on_event(payload)
         finally:
             self._connected.clear()
+            if self._running:
+                logger.warning("NapCat [CONN] recv loop ended, connection dropped")
             self._fail_pending(NapCatTransportError("NapCat 接收循环已结束"))
 
     def _decode_frame(self, frame: Any) -> dict[str, Any] | None:
@@ -698,21 +703,27 @@ class NapCatTransport:
             try:
                 frame = frame.decode("utf-8")
             except UnicodeDecodeError:
-                logger.warning("NapCat 收到无法解码的二进制帧")
+                logger.warning("NapCat [CONN] undecodable binary frame")
                 return None
 
         if not isinstance(frame, str):
-            logger.warning("NapCat 收到未知帧类型: {}", type(frame))
+            logger.warning(
+                "NapCat [CONN] unsupported frame_type={}",
+                type(frame).__name__,
+            )
             return None
 
         try:
             payload = json.loads(frame)
         except json.JSONDecodeError:
-            logger.warning("NapCat 收到非法 JSON 帧: {}", frame[:500])
+            logger.warning("NapCat [CONN] invalid JSON frame preview={!r}", frame[:120])
             return None
 
         if not isinstance(payload, dict):
-            logger.warning("NapCat 收到非对象 JSON 帧: {}", payload)
+            logger.warning(
+                "NapCat [CONN] non-object JSON payload preview={!r}",
+                repr(payload)[:120],
+            )
             return None
         return payload
 
@@ -731,7 +742,11 @@ class NapCatTransport:
         if echo:
             future = self._pending.get(echo)
             if future is None or future.done():
-                logger.debug("NapCat 收到未知 echo 响应: {}", echo)
+                logger.warning(
+                    "NapCat [CONN] unexpected echo={} pending={}",
+                    echo,
+                    len(self._pending),
+                )
                 return
             future.set_result(payload)
             return
@@ -739,11 +754,15 @@ class NapCatTransport:
         if len(self._pending) == 1:
             future = next(iter(self._pending.values()))
             if not future.done():
-                logger.debug("NapCat 响应缺少 echo，已按唯一挂起请求回填")
+                logger.debug("NapCat [CONN] missing echo matched single pending request")
                 future.set_result(payload)
             return
 
-        logger.debug("NapCat 响应缺少 echo，已忽略: {}", payload)
+        logger.debug(
+            "NapCat [CONN] missing echo ignored pending={} preview={!r}",
+            len(self._pending),
+            repr(payload)[:120],
+        )
 
     def _fail_pending(self, exc: Exception) -> None:
         """批量终止挂起中的 action。"""
@@ -806,7 +825,7 @@ class SessionWorker:
                     raise
                 except Exception:
                     logger.exception(
-                        "NapCat SessionWorker 处理事件失败，session_key={}",
+                        "NapCat [ROUTE] session worker failed session={}",
                         self._session_key,
                     )
                 finally:
@@ -845,11 +864,20 @@ class EventRouter:
         """路由事件到对应 session 的串行 Worker。"""
         session_key = extract_session_key(payload, self._self_id_getter())
         if not session_key:
-            logger.debug("NapCat 跳过不可路由事件: {}", _summarize_event(payload))
+            logger.debug(
+                "NapCat [ROUTE] event skipped unroutable summary={}",
+                _summarize_event(payload),
+            )
             return
 
         if not check_source_gate(payload, self._config, self._self_id_getter()):
-            logger.debug("NapCat 来源未通过，已丢弃: {}", _summarize_event(payload))
+            ctx = _build_event_ctx(payload)
+            logger.info(
+                "NapCat [ROUTE] source rejected user_id={} group_id={} post_type={}",
+                ctx.user_id or "?",
+                ctx.source_group_id or "?",
+                ctx.post_type or "?",
+            )
             return
 
         worker = self._workers.get(session_key)
@@ -1245,7 +1273,7 @@ class MediaDownloader:
     async def download(self, ref: MediaReference) -> str | None:
         """下载单个媒体引用。"""
         if not _is_https_url(ref.url):
-            logger.debug("NapCat 媒体下载已跳过（仅支持 HTTPS）: {}", ref.url)
+            logger.debug("NapCat [MEDIA] skipped non-https media url={}", ref.url)
             return None
 
         filename = _safe_media_filename(ref.filename, fallback=f"{ref.kind}.bin")
@@ -1263,7 +1291,7 @@ class MediaDownloader:
         except Exception:
             with contextlib.suppress(FileNotFoundError):
                 tmp_path.unlink()
-            logger.exception("NapCat 媒体下载失败: {}", ref.url)
+            logger.exception("NapCat [MEDIA] download failed url={}", ref.url)
             return None
 
     def _read_remote_bytes(self, url: str) -> bytes:
@@ -1309,7 +1337,7 @@ class NapCatMessageDetailFetcher:
             if isinstance(data.get("message"), dict):
                 return data["message"]
             return data
-        logger.warning("NapCat get_msg 返回格式不符合预期: {}", response)
+        logger.warning("NapCat [MEDIA] get_msg response malformed preview={!r}", repr(response)[:160])
         return None
 
     async def get_forward_msg(self, forward_id: str) -> list[dict[str, Any]]:
@@ -1320,7 +1348,10 @@ class NapCatMessageDetailFetcher:
             return [item for item in data["messages"] if isinstance(item, dict)]
         if isinstance(data, list):
             return [item for item in data if isinstance(item, dict)]
-        logger.warning("NapCat get_forward_msg 返回格式不符合预期: {}", response)
+        logger.warning(
+            "NapCat [MEDIA] get_forward_msg response malformed preview={!r}",
+            repr(response)[:160],
+        )
         return []
 
 
@@ -1436,7 +1467,7 @@ class ContactDirectory:
                 raise
             except Exception:
                 logger.warning(
-                    "NapCat 获取群成员信息失败，group_id={}, user_id={}",
+                    "NapCat [MEDIA] get_group_member_info failed group_id={} user_id={}",
                     group_id,
                     user_id,
                 )
@@ -1480,7 +1511,10 @@ class ContactDirectory:
                 response = await self._transport.call_action("get_friend_list", {})
                 data = response.get("data")
                 if not isinstance(data, list):
-                    logger.warning("NapCat get_friend_list 返回格式不符合预期: {}", response)
+                    logger.warning(
+                        "NapCat [MEDIA] get_friend_list response malformed preview={!r}",
+                        repr(response)[:160],
+                    )
                     self._friend_cache_expires_at = now + float(self._config.friend_cache_ttl_s)
                     return
 
@@ -1496,7 +1530,7 @@ class ContactDirectory:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.warning("NapCat 获取好友列表失败", exc_info=True)
+                logger.warning("NapCat [MEDIA] get_friend_list failed", exc_info=True)
             finally:
                 self._friend_cache_expires_at = (
                     time.monotonic() + float(self._config.friend_cache_ttl_s)
@@ -1548,7 +1582,7 @@ class Enricher:
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("NapCat Enricher 并行补全过程失败")
+            logger.exception("NapCat [MEDIA] enrich fanout failed")
 
         return EnrichedInbound(
             inbound=inbound,
@@ -1574,7 +1608,7 @@ class Enricher:
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("NapCat 展开 reply 失败，reply_id={}", reply_id)
+            logger.exception("NapCat [MEDIA] expand reply failed reply_id={}", reply_id)
             return []
 
     async def _expand_forward(
@@ -1603,7 +1637,7 @@ class Enricher:
                 media_paths.extend(item_media_paths)
                 if normalized.forward_refs:
                     logger.debug(
-                        "NapCat forward 节点内再次出现 forward，当前版本保留占位但不递归展开，message_id={}",
+                        "NapCat [MEDIA] nested forward left as placeholder message_id={}",
                         normalized.message_id,
                     )
                 bundle.nodes.append(
@@ -1623,7 +1657,10 @@ class Enricher:
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("NapCat 展开 forward 失败，forward_id={}", forward_ref.forward_id)
+            logger.exception(
+                "NapCat [MEDIA] expand forward failed forward_id={}",
+                forward_ref.forward_id,
+            )
             return bundle, []
 
     def _normalize_forward_node(
@@ -1875,8 +1912,14 @@ def decide_notice_trigger(
 
     session_key = inbound.chat.session_key
     previous = last_poke_monotonic.get(session_key, 0.0)
-    if now_monotonic - previous < float(config.poke_cooldown_seconds):
-        return TriggerDecision(False, "poke_cooldown")
+    cooldown = float(config.poke_cooldown_seconds)
+    delta = now_monotonic - previous
+    if delta < cooldown:
+        return TriggerDecision(
+            False,
+            "poke_cooldown",
+            detail=f"delta:{delta:.1f}s<{cooldown:g}s",
+        )
 
     last_poke_monotonic[session_key] = now_monotonic
     return TriggerDecision(True, "poke")
@@ -1935,7 +1978,11 @@ def check_trigger(
     if sample < probability:
         return TriggerDecision(True, "probability")
 
-    return TriggerDecision(False, "passive_record")
+    return TriggerDecision(
+        False,
+        "probability",
+        detail=f"sample:{sample:.3f}>={probability:.3f}",
+    )
 
 
 # ==============================
@@ -2041,8 +2088,8 @@ class SessionBufferState:
                         self.bot_message_ids.remove(removed_id)
             if self.last_sent_cursor > 0:
                 self.last_sent_cursor -= 1
-            logger.debug(
-                "NapCat SessionBuffer 已修剪最旧记录，session_key={}, removed_id={}",
+            logger.info(
+                "NapCat [SESSION] buffer trimmed session={} removed_id={}",
                 self.chat.session_key,
                 removed.message_id,
             )
@@ -2601,12 +2648,13 @@ class OutboundSender:
     async def send(self, msg: OutboundMessage) -> None:
         """发送一条 nanobot 出站消息。"""
         if self._should_suppress_outbound(msg):
+            logger.debug("NapCat [SEND] suppressed empty reply chat_id={}", msg.chat_id)
             return
 
         try:
             route, target_id = _parse_internal_chat_id(msg.chat_id)
         except ValueError:
-            logger.error("NapCat send 收到非法 chat_id: {}", msg.chat_id)
+            logger.error("NapCat [SEND] invalid chat_id={}", msg.chat_id)
             return
 
         is_progress = bool(msg.metadata.get("_progress"))
@@ -2632,6 +2680,12 @@ class OutboundSender:
 
         response = await self._transport.call_action(action, params)
         message_id = self._extract_message_id(response)
+        logger.info(
+            "NapCat [SEND] ok chat_id={} out_msg_id={} content_len={}",
+            msg.chat_id,
+            message_id or "?",
+            len(_coerce_str(msg.content)),
+        )
         if message_id and not is_progress:
             self._session_store.record_bot_message(
                 chat_id=msg.chat_id,
@@ -2743,9 +2797,18 @@ class EventPipeline:
         command = normalized.text.strip().lower()
         if _is_exact_supported_command(command):
             if normalized.sender_id not in _normalize_id_list(self._config.super_admins):
+                logger.warning(
+                    "NapCat [ROUTE] command rejected non-admin sender_id={} cmd={}",
+                    normalized.sender_id,
+                    command,
+                )
                 return
             await self._publish_command(normalized)
             if command == "/new":
+                logger.info(
+                    "NapCat [SESSION] cleared by /new session={}",
+                    normalized.chat.session_key,
+                )
                 self._session_store.clear(normalized.chat.session_key)
             return
 
@@ -2766,10 +2829,12 @@ class EventPipeline:
         )
 
         if not decision.should_reply:
-            logger.debug(
-                "NapCat 已记入缓冲但不触发回复，reason={}, session_key={}",
+            logger.info(
+                "NapCat [TRIGGER] passive record reason={} session={} msg_id={} detail={}",
                 decision.reason,
                 normalized.chat.session_key,
+                normalized.message_id,
+                _format_trigger_detail(decision),
             )
             return
 
@@ -2806,7 +2871,7 @@ class EventPipeline:
         """直接向上游发布原生命令，不经过 CQMSG 封装。"""
         if normalized.text.strip().lower() == "/status":
             logger.info(
-                "NapCat SessionBuffer cache table:\n{}",
+                "NapCat [SESSION] cache table\n{}",
                 self._session_store.render_debug_table(),
             )
 
@@ -2915,12 +2980,12 @@ class NapCatChannel(BaseChannel):
     async def start(self) -> None:
         """启动 NapCat Channel。"""
         if not self.config.url.strip():
-            logger.error("NapCat url 未配置")
+            logger.error("NapCat [CONN] missing websocket url")
             return
 
         self.config.url = _normalize_ws_url(self.config.url)
         if not self.config.url.startswith(("ws://", "wss://")):
-            logger.error("NapCat url 必须以 ws:// 或 wss:// 开头: {}", self.config.url)
+            logger.error("NapCat [CONN] invalid websocket url url={}", self.config.url)
             return
 
         self._running = True
@@ -2941,9 +3006,8 @@ class NapCatChannel(BaseChannel):
         """通过 NapCat 发送一条消息。"""
         await self._outbound.send(msg)
 
-    async def _on_transport_connected(self, connection_id: int) -> None:
+    async def _on_transport_connected(self) -> None:
         """处理 NapCat 建连后的初始化逻辑。"""
-        del connection_id
         if self._identity_task is not None and not self._identity_task.done():
             self._identity_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -2965,7 +3029,7 @@ class NapCatChannel(BaseChannel):
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("NapCat 获取登录信息失败")
+            logger.exception("NapCat [CONN] refresh login identity failed")
 
     async def _on_transport_event(self, payload: dict[str, Any]) -> None:
         """处理 NapCat 上报事件。"""
@@ -2979,13 +3043,16 @@ class NapCatChannel(BaseChannel):
         event_self_id = _coerce_optional_str(payload.get("self_id"))
         if event_self_id and event_self_id != self._self_id:
             self._self_id = event_self_id
-            logger.info("NapCat 已从事件同步 self_id={}", self._self_id)
+            logger.info("NapCat [CONN] self_id updated from event self_id={}", self._self_id)
 
     def _apply_login_info(self, response: dict[str, Any]) -> None:
         """应用 `get_login_info` 响应中的身份信息。"""
         data = response.get("data")
         if not isinstance(data, dict):
-            logger.warning("NapCat get_login_info 响应缺少 data: {}", response)
+            logger.warning(
+                "NapCat [CONN] get_login_info missing data preview={!r}",
+                repr(response)[:160],
+            )
             return
 
         login_self_id = _coerce_optional_str(data.get("user_id"))
@@ -2995,7 +3062,7 @@ class NapCatChannel(BaseChannel):
         if login_self_name:
             self._self_name = login_self_name
         logger.info(
-            "NapCat 登录信息已刷新，self_id={}, nickname={}",
+            "NapCat [CONN] login identity refreshed self_id={} nickname={}",
             self._self_id or "unknown",
             self._self_name or "unknown",
         )
