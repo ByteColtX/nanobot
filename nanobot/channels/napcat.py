@@ -211,7 +211,6 @@ def _is_exact_supported_command(text: str) -> bool:
     return text.strip().lower() in _SUPPORTED_COMMANDS
 
 
-
 def _to_datetime(timestamp: Any) -> datetime:
     """将 OneBot 时间戳转换为 `datetime`。"""
     ts = _coerce_int(timestamp)
@@ -522,6 +521,16 @@ class TriggerDecision:
 def _format_trigger_detail(decision: TriggerDecision) -> str:
     """格式化触发细节，保持日志字段结构稳定。"""
     return decision.detail or "-"
+
+
+def _find_nickname_trigger(text: str, triggers: list[str]) -> str | None:
+    """返回首个命中的昵称触发词，便于日志排查。"""
+    lowered_text = text.lower()
+    for trigger in triggers:
+        normalized = trigger.strip()
+        if normalized and normalized.lower() in lowered_text:
+            return normalized
+    return None
 
 
 # ==============================
@@ -1922,7 +1931,8 @@ def decide_notice_trigger(
         )
 
     last_poke_monotonic[session_key] = now_monotonic
-    return TriggerDecision(True, "poke")
+    detail = f"target:{inbound.target_id}" if inbound.target_id else None
+    return TriggerDecision(True, "poke", detail=detail)
 
 
 
@@ -1951,18 +1961,22 @@ def check_trigger(
         )
 
     if config.trigger_on_at and inbound.at_self:
-        return TriggerDecision(True, "at_self")
+        return TriggerDecision(True, "at_self", detail="mention:bot")
 
     if (
         config.trigger_on_reply_to_bot
         and inbound.reply_id
         and state.is_bot_message(inbound.reply_id)
     ):
-        return TriggerDecision(True, "reply_to_bot")
+        return TriggerDecision(True, "reply_to_bot", detail=f"reply_id:{inbound.reply_id}")
 
-    lowered_text = text.lower()
-    if any(trigger.lower() in lowered_text for trigger in config.nickname_triggers):
-        return TriggerDecision(True, "nickname_trigger")
+    nickname_trigger = _find_nickname_trigger(text, config.nickname_triggers)
+    if nickname_trigger is not None:
+        return TriggerDecision(
+            True,
+            "nickname_trigger",
+            detail=f"keyword:{nickname_trigger}",
+        )
 
     probability = (
         config.private_trigger_prob
@@ -1976,7 +1990,11 @@ def check_trigger(
         message_time=inbound.time,
     )
     if sample < probability:
-        return TriggerDecision(True, "probability")
+        return TriggerDecision(
+            True,
+            "probability",
+            detail=f"sample:{sample:.3f}<{probability:.3f}",
+        )
 
     return TriggerDecision(
         False,
@@ -2861,6 +2879,14 @@ class EventPipeline:
         content = normalized.text.strip()
         if not _is_exact_supported_command(content):
             content = self._serializer.build(state)
+
+        logger.info(
+            "NapCat [TRIGGER] dispatch reason={} session={} msg_id={} detail={}",
+            decision.reason,
+            normalized.chat.session_key,
+            normalized.message_id,
+            _format_trigger_detail(decision),
+        )
 
         metadata = {
             "message_id": normalized.message_id,
