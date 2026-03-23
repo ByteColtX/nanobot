@@ -1696,6 +1696,18 @@ def check_source_gate(
     self_id: str,
 ) -> bool:
     """检查事件来源是否允许进入后续处理。"""
+    def _extract_source_group_id() -> str | None:
+        if post_type == "notice":
+            return _coerce_optional_str(payload.get("group_id"))
+        if message_type == "group":
+            return _coerce_optional_str(payload.get("group_id"))
+        if message_type != "private":
+            return None
+        sub_type = _coerce_str(payload.get("sub_type")).strip().lower()
+        if sub_type != "group":
+            return None
+        return _coerce_optional_str(payload.get("target_id"))
+
     post_type = _coerce_str(payload.get("post_type")).strip().lower()
     user_id = (
         _coerce_optional_str(payload.get("user_id"))
@@ -1703,6 +1715,18 @@ def check_source_gate(
         or ""
     )
     message_type = _coerce_str(payload.get("message_type")).strip().lower()
+    allow_ids = _normalize_id_list(config.allow_from)
+    blacklist_private_ids = _normalize_id_list(config.blacklist_private_ids)
+    blacklist_group_ids = _normalize_id_list(config.blacklist_group_ids)
+    source_group_id = _extract_source_group_id()
+    has_group_source = bool(source_group_id)
+
+    # 来源会话中的群黑名单优先，包括群消息、群通知和群临时私聊。
+    if source_group_id and source_group_id in blacklist_group_ids:
+        return False
+    # 没有群来源时，按私聊来源处理，私聊黑名单同样优先于 allow_from。
+    if not has_group_source and user_id and user_id in blacklist_private_ids:
+        return False
 
     if post_type == "message_sent":
         return not config.ignore_self_messages
@@ -1722,26 +1746,16 @@ def check_source_gate(
         target_id = _coerce_optional_str(payload.get("target_id"))
         if self_id and target_id and target_id != self_id:
             return False
-        group_id = _coerce_optional_str(payload.get("group_id"))
-        if group_id and group_id in set(config.blacklist_group_ids):
-            return False
-        if "*" not in config.allow_from and user_id not in set(config.allow_from):
+        if "*" not in allow_ids and user_id not in allow_ids:
             return False
         return True
 
-    if message_type == "group":
-        group_id = _coerce_optional_str(payload.get("group_id"))
-        if group_id and group_id in set(config.blacklist_group_ids):
-            return False
-    elif message_type == "private":
-        if user_id and user_id in set(config.blacklist_private_ids):
-            return False
-    else:
+    if message_type not in {"group", "private"}:
         return False
 
-    if "*" in config.allow_from:
+    if "*" in allow_ids:
         return True
-    return user_id in set(config.allow_from)
+    return user_id in allow_ids
 
 
 
