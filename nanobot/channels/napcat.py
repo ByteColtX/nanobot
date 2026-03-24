@@ -1279,11 +1279,11 @@ class MediaDownloader:
             return None
 
         self._root.mkdir(parents=True, exist_ok=True)
-        tmp_path = destination.with_suffix(destination.suffix + ".part")
+        tmp_path = destination.with_name(f"{destination.name}.{uuid.uuid4().hex}.part")
 
         try:
             data = await asyncio.to_thread(self._read_remote_bytes, ref.url)
-            await asyncio.to_thread(self._write_atomic, tmp_path, destination, data)
+            await asyncio.to_thread(self._write_if_absent, tmp_path, destination, data)
             return str(destination.resolve())
         except Exception:
             with contextlib.suppress(FileNotFoundError):
@@ -1318,10 +1318,16 @@ class MediaDownloader:
             return b"".join(chunks)
 
     @staticmethod
-    def _write_atomic(tmp_path: Path, target_path: Path, data: bytes) -> None:
-        """使用临时文件原子写入目标路径。"""
+    def _write_if_absent(tmp_path: Path, target_path: Path, data: bytes) -> None:
+        """将临时文件发布到目标路径；若目标已存在则保留现有文件。"""
         tmp_path.write_bytes(data)
-        os.replace(tmp_path, target_path)
+        try:
+            os.link(tmp_path, target_path)
+        except FileExistsError:
+            return
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                tmp_path.unlink()
 
 
 class NapCatMessageDetailFetcher:
