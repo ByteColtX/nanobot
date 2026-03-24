@@ -2095,11 +2095,11 @@ class SessionBufferState:
                         self.bot_message_ids.remove(removed_id)
             if self.last_sent_cursor > 0:
                 self.last_sent_cursor -= 1
-            logger.info(
-                "NapCat [SESSION] buffer trimmed session={} removed_id={}",
-                self.chat.session_key,
-                removed.message_id,
-            )
+            # logger.info(
+            #     "NapCat [SESSION] buffer trimmed session={} removed_id={}",
+            #     self.chat.session_key,
+            #     removed.message_id,
+            # )
 
 
 class SessionBufferStore:
