@@ -2004,10 +2004,8 @@ class SessionBufferState:
 
     chat: ChatRef
     buffer_size: int
-    records: list[ContextMessageRecord] = field(default_factory=list)
+    records: deque[ContextMessageRecord] = field(default_factory=deque)
     last_sent_cursor: int = 0
-    bot_message_ids: deque[str] = field(default_factory=deque)
-    message_ids: deque[str] = field(default_factory=deque)
     _message_id_set: set[str] = field(default_factory=set)
     _bot_message_id_set: set[str] = field(default_factory=set)
 
@@ -2025,7 +2023,6 @@ class SessionBufferState:
             return
 
         self.records.append(record)
-        self.message_ids.append(record.message_id)
         self._message_id_set.add(record.message_id)
         if record.role == "assistant" and record.message_id:
             self._register_bot_message_id(record.message_id)
@@ -2036,7 +2033,7 @@ class SessionBufferState:
         if not self.records:
             return []
         cursor = min(max(self.last_sent_cursor, 0), len(self.records))
-        return self.records[cursor:]
+        return list(self.records)[cursor:]
 
     def mark_sent_to_end(self) -> None:
         """将游标推进到当前缓冲末尾。"""
@@ -2071,8 +2068,6 @@ class SessionBufferState:
         """清空当前 session 的全部缓冲状态。"""
         self.records.clear()
         self.last_sent_cursor = 0
-        self.bot_message_ids.clear()
-        self.message_ids.clear()
         self._message_id_set.clear()
         self._bot_message_id_set.clear()
 
@@ -2080,20 +2075,15 @@ class SessionBufferState:
         """记录一条机器人消息 ID。"""
         if not message_id or message_id in self._bot_message_id_set:
             return
-        self.bot_message_ids.append(message_id)
         self._bot_message_id_set.add(message_id)
 
     def _trim_if_needed(self) -> None:
         """按 session_buffer_size 修剪缓冲。"""
         while len(self.records) > self.buffer_size:
-            removed = self.records.pop(0)
-            if self.message_ids:
-                removed_id = self.message_ids.popleft()
-                self._message_id_set.discard(removed_id)
-                if removed_id in self._bot_message_id_set:
-                    self._bot_message_id_set.discard(removed_id)
-                    with contextlib.suppress(ValueError):
-                        self.bot_message_ids.remove(removed_id)
+            removed = self.records.popleft()
+            removed_id = removed.message_id
+            self._message_id_set.discard(removed_id)
+            self._bot_message_id_set.discard(removed_id)
             if self.last_sent_cursor > 0:
                 self.last_sent_cursor -= 1
             # logger.info(
@@ -2221,7 +2211,7 @@ class SessionBufferStore:
                     str(len(state.records)),
                     str(len(state.get_unsent_records())),
                     str(state.last_sent_cursor),
-                    str(len(state.bot_message_ids)),
+                    str(len(state._bot_message_id_set)),
                     last_message_id,
                 )
             )
