@@ -5,7 +5,6 @@ import contextlib
 import json
 import os
 import hashlib
-import re
 import time
 import uuid
 from collections import deque
@@ -23,6 +22,7 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Base
+from nanobot.security.network import validate_resolved_url, validate_url_target
 
 
 # ==============================
@@ -37,12 +37,11 @@ _IMAGE_EXTENSIONS = frozenset(
     {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".heic", ".heif"}
 )
 _AUDIO_EXTENSIONS = frozenset(
-    {".mp3", ".wav", ".ogg", ".opus", ".m4a", ".aac", ".flac", ".amr"}
+    {".mp3", ".wav", ".ogg", ".opus", ".m4a", ".aac", ".flac", ".amr", ".silk"}
 )
 _VIDEO_EXTENSIONS = frozenset(
     {".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv"}
 )
-_INVALID_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._\-]+")
 _IDENTITY_INIT_TIMEOUT_SECONDS = 3.0
 _REQUEST_TIMEOUT_SECONDS = 20.0
 _RECONNECT_BASE_SECONDS = 1.0
@@ -121,20 +120,6 @@ def _truncate_text(text: str, max_chars: int) -> str:
 
 
 
-def _safe_media_filename(filename: str, fallback: str = "file.bin") -> str:
-    """清洗媒体文件名。"""
-    name = os.path.basename(filename or "").strip()
-    if not name:
-        return fallback
-
-    stem, ext = os.path.splitext(name)
-    stem = _INVALID_FILENAME_CHARS.sub("_", stem).strip("._") or "file"
-    ext = _INVALID_FILENAME_CHARS.sub("", ext)[:20]
-    safe_name = f"{stem[:180]}{ext}"
-    return safe_name or fallback
-
-
-
 def _basename_only(value: str, fallback: str) -> str:
     """仅保留文件名部分。"""
     name = os.path.basename(value or "").strip()
@@ -182,7 +167,7 @@ def _is_http_url(url: str) -> bool:
 
 
 def _guess_media_cq_type(path: str) -> Literal["image", "record", "video", "file"]:
-    """根据文件扩展名猜测 CQ 码媒体类型。"""
+    """根据扩展名猜测 CQ 码媒体类型。"""
     suffix = Path(path).suffix.lower()
     if suffix in _IMAGE_EXTENSIONS:
         return "image"
@@ -279,7 +264,7 @@ def _parse_internal_chat_id(chat_id: str) -> tuple[Literal["group", "private"], 
 
 def _pick_segment_filename(data: dict[str, Any], fallback: str) -> str:
     """从消息段数据中提取尽量稳定的文件名。"""
-    for key in ("name", "file", "path", "url"):
+    for key in ("file", "name", "path", "url"):
         value = _coerce_optional_str(data.get(key))
         if value:
             return _basename_only(value, fallback)
@@ -1009,22 +994,12 @@ class NapCatMessageParser:
 
             if seg_type == "video":
                 name = _pick_segment_filename(data, "video")
-                url = _coerce_str(data.get("url"))
-                if _is_http_url(url):
-                    media_refs.append(
-                        MediaReference(kind="video", url=url, filename=name)
-                    )
                 body_tokens.append(BodyToken(kind="video", filename=name))
                 parts.append("[video]")
                 continue
 
             if seg_type == "file":
                 name = _pick_segment_filename(data, "file")
-                url = _coerce_str(data.get("url"))
-                if _is_http_url(url):
-                    media_refs.append(
-                        MediaReference(kind="file", url=url, filename=name)
-                    )
                 body_tokens.append(BodyToken(kind="file", filename=name))
                 parts.append(f"[file:{name}]")
                 continue
@@ -1285,10 +1260,19 @@ class MediaDownloader:
             logger.debug("NapCat [MEDIA] skipped non-https media url={}", ref.url)
             return None
 
-        filename = _safe_media_filename(ref.filename, fallback=f"{ref.kind}.bin")
+        filename = _basename_only(ref.filename, f"{ref.kind}.bin")
         destination = self._root / filename
         if destination.exists():
             return str(destination.resolve())
+
+        ok, error = validate_url_target(ref.url)
+        if not ok:
+            logger.warning(
+                "NapCat [MEDIA] skipped unsafe media url={} err={}",
+                ref.url,
+                error,
+            )
+            return None
 
         self._root.mkdir(parents=True, exist_ok=True)
         tmp_path = destination.with_suffix(destination.suffix + ".part")
@@ -1310,6 +1294,11 @@ class MediaDownloader:
             headers={"User-Agent": "nanobot-napcat/1.0"},
         )
         with urllib_request.urlopen(request, timeout=self._timeout) as response:
+            final_url = response.geturl()
+            ok, error = validate_resolved_url(final_url)
+            if not ok:
+                raise NapCatError(f"媒体重定向被拦截: {error}")
+
             chunks: list[bytes] = []
             total = 0
             while True:
@@ -2765,7 +2754,7 @@ class OutboundSender:
         abs_path = path.resolve()
         cq_type = _guess_media_cq_type(str(abs_path))
         file_uri = abs_path.as_uri()
-        filename = _safe_media_filename(abs_path.name)
+        filename = abs_path.name
         return f"[CQ:{cq_type},file={file_uri},name={filename}]"
 
     @staticmethod
