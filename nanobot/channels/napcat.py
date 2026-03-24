@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import hashlib
+import re
 import time
 import uuid
 from collections import deque
@@ -57,6 +58,7 @@ _RECONNECT_BASE_SECONDS = 1.0
 _RECONNECT_MAX_SECONDS = 30.0
 _KEEPALIVE_PING_SECONDS = 20
 _AGENT_EMPTY_RESPONSE_FALLBACK = "I've completed processing but have no response to give."
+_CQ_OUTBOUND_RE = re.compile(r"\[CQ:([^,\]]+)(?:,([^\]]+))?\]")
 
 
 def _json_dumps_compact(data: Any) -> str:
@@ -278,6 +280,23 @@ def _pick_segment_filename(data: dict[str, Any], fallback: str) -> str:
         if value:
             return _basename_only(value, fallback)
     return fallback
+
+
+def _parse_cq_params(params_raw: str) -> dict[str, str]:
+    """解析 CQ 参数串。"""
+    params: dict[str, str] = {}
+    if not params_raw:
+        return params
+    for chunk in params_raw.split(","):
+        part = _coerce_str(chunk).strip()
+        if not part or "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = _coerce_str(key).strip()
+        value = _coerce_str(value).strip()
+        if key:
+            params[key] = value
+    return params
 
 
 # ==============================
@@ -2633,12 +2652,14 @@ class OutboundSender:
         session_store: SessionBufferStore,
         self_id_getter: Callable[[], str],
         self_name_getter: Callable[[], str],
+        media_root: Path,
     ):
         """初始化出站发送器。"""
         self._transport = transport
         self._session_store = session_store
         self._self_id_getter = self_id_getter
         self._self_name_getter = self_name_getter
+        self._media_root = media_root
 
     async def send(self, msg: OutboundMessage) -> None:
         """发送一条 nanobot 出站消息。"""
@@ -2734,7 +2755,9 @@ class OutboundSender:
             pieces.append(self._build_media_cq_code(media_path))
 
         merged = "".join(pieces).strip()
-        return merged or "[empty message]"
+        if not merged:
+            return "[empty message]"
+        return self._normalize_outbound_cq_images(merged)
 
     def _build_media_cq_code(self, media_path: str) -> str:
         """将本地媒体路径转换为 CQ 码。"""
@@ -2744,6 +2767,62 @@ class OutboundSender:
         file_uri = abs_path.as_uri()
         filename = abs_path.name
         return f"[CQ:{cq_type},file={file_uri},name={filename}]"
+
+    def _normalize_outbound_cq_images(self, text: str) -> str:
+        """把 CQ:image 的本地 file 参数改写为 file:// URI。"""
+        source = _coerce_str(text)
+        if "[CQ:" not in source:
+            return source
+
+        out: list[str] = []
+        pos = 0
+        for match in _CQ_OUTBOUND_RE.finditer(source):
+            out.append(source[pos:match.start()])
+
+            cq_text = match.group(0)
+            cq_type = _coerce_str(match.group(1)).strip().lower()
+            params_raw = _coerce_str(match.group(2))
+            if cq_type != "image":
+                out.append(cq_text)
+                pos = match.end()
+                continue
+
+            params = _parse_cq_params(params_raw)
+            file_value = _coerce_str(params.get("file")).strip()
+            if not file_value or self._is_cq_file_uri(file_value):
+                out.append(cq_text)
+                pos = match.end()
+                continue
+
+            resolved = self._resolve_outbound_image_file(file_value)
+            if resolved is None:
+                out.append(cq_text)
+                pos = match.end()
+                continue
+
+            params["file"] = resolved.as_uri()
+            params_str = ",".join(f"{key}={value}" for key, value in params.items() if key)
+            out.append(f"[CQ:image,{params_str}]")
+            pos = match.end()
+
+        out.append(source[pos:])
+        return "".join(out)
+
+    @staticmethod
+    def _is_cq_file_uri(file_value: str) -> bool:
+        """判断 CQ image 的 file 参数是否已是 URI/base64。"""
+        lower = _coerce_str(file_value).strip().lower()
+        return lower.startswith(("file://", "http://", "https://", "base64://"))
+
+    def _resolve_outbound_image_file(self, file_value: str) -> Path | None:
+        """将 CQ image 的 file 参数解析为可读本地文件。"""
+        path = Path(os.path.expanduser(_coerce_str(file_value).strip()))
+        if not path.is_absolute():
+            path = self._media_root / _coerce_str(file_value).strip()
+        try:
+            return path.resolve() if path.exists() and path.is_file() else None
+        except Exception:
+            return None
 
     @staticmethod
     def _extract_message_id(response: dict[str, Any]) -> str | None:
@@ -2950,6 +3029,11 @@ class NapCatChannel(BaseChannel):
         self._self_id = ""
         self._self_name = ""
         self._identity_task: asyncio.Task[None] | None = None
+        self._media_root = (
+            Path(self.config.media_dir).expanduser()
+            if self.config.media_dir
+            else get_media_dir("napcat")
+        )
 
         self._session_store = SessionBufferStore(self.config)
         self._parser = NapCatMessageParser(self._get_self_id)
@@ -2998,6 +3082,7 @@ class NapCatChannel(BaseChannel):
             session_store=self._session_store,
             self_id_getter=self._get_self_id,
             self_name_getter=self._get_self_name,
+            media_root=self._media_root,
         )
 
     async def start(self) -> None:
