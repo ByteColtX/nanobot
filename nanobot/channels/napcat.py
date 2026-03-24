@@ -150,7 +150,7 @@ def _normalize_ws_url(url: str) -> str:
     text = url.strip()
     if not text:
         return ""
-    return text.rstrip("/")
+    return text
 
 
 
