@@ -9,9 +9,8 @@ from typer.testing import CliRunner
 from nanobot.bus.events import OutboundMessage
 from nanobot.cli.commands import _make_provider, app
 from nanobot.config.schema import Config
-from nanobot.providers.litellm_provider import LiteLLMProvider
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
-from nanobot.providers.registry import find_by_model, find_by_name
+from nanobot.providers.registry import find_by_name
 
 runner = CliRunner()
 
@@ -228,7 +227,7 @@ def test_config_matches_explicit_ollama_prefix_without_api_key():
     config.agents.defaults.model = "ollama/llama3.2"
 
     assert config.get_provider_name() == "ollama"
-    assert config.get_api_base() == "http://localhost:11434"
+    assert config.get_api_base() == "http://localhost:11434/v1"
 
 
 def test_config_explicit_ollama_provider_uses_default_localhost_api_base():
@@ -237,7 +236,7 @@ def test_config_explicit_ollama_provider_uses_default_localhost_api_base():
     config.agents.defaults.model = "llama3.2"
 
     assert config.get_provider_name() == "ollama"
-    assert config.get_api_base() == "http://localhost:11434"
+    assert config.get_api_base() == "http://localhost:11434/v1"
 
 
 def test_config_accepts_camel_case_explicit_provider_name_for_coding_plan():
@@ -272,12 +271,12 @@ def test_config_auto_detects_ollama_from_local_api_base():
     config = Config.model_validate(
         {
             "agents": {"defaults": {"provider": "auto", "model": "llama3.2"}},
-            "providers": {"ollama": {"apiBase": "http://localhost:11434"}},
+            "providers": {"ollama": {"apiBase": "http://localhost:11434/v1"}},
         }
     )
 
     assert config.get_provider_name() == "ollama"
-    assert config.get_api_base() == "http://localhost:11434"
+    assert config.get_api_base() == "http://localhost:11434/v1"
 
 
 def test_config_prefers_ollama_over_vllm_when_both_local_providers_configured():
@@ -286,13 +285,13 @@ def test_config_prefers_ollama_over_vllm_when_both_local_providers_configured():
             "agents": {"defaults": {"provider": "auto", "model": "llama3.2"}},
             "providers": {
                 "vllm": {"apiBase": "http://localhost:8000"},
-                "ollama": {"apiBase": "http://localhost:11434"},
+                "ollama": {"apiBase": "http://localhost:11434/v1"},
             },
         }
     )
 
     assert config.get_provider_name() == "ollama"
-    assert config.get_api_base() == "http://localhost:11434"
+    assert config.get_api_base() == "http://localhost:11434/v1"
 
 
 def test_config_falls_back_to_vllm_when_ollama_not_configured():
@@ -309,19 +308,13 @@ def test_config_falls_back_to_vllm_when_ollama_not_configured():
     assert config.get_api_base() == "http://localhost:8000"
 
 
-def test_find_by_model_prefers_explicit_prefix_over_generic_codex_keyword():
-    spec = find_by_model("github-copilot/gpt-5.3-codex")
+def test_openai_compat_provider_passes_model_through():
+    from nanobot.providers.openai_compat_provider import OpenAICompatProvider
 
-    assert spec is not None
-    assert spec.name == "github_copilot"
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
+        provider = OpenAICompatProvider(default_model="github-copilot/gpt-5.3-codex")
 
-
-def test_litellm_provider_canonicalizes_github_copilot_hyphen_prefix():
-    provider = LiteLLMProvider(default_model="github-copilot/gpt-5.3-codex")
-
-    resolved = provider._resolve_model("github-copilot/gpt-5.3-codex")
-
-    assert resolved == "github_copilot/gpt-5.3-codex"
+    assert provider.get_default_model() == "github-copilot/gpt-5.3-codex"
 
 
 def test_openai_codex_strip_prefix_supports_hyphen_and_underscore():
@@ -346,7 +339,7 @@ def test_make_provider_passes_extra_headers_to_custom_provider():
         }
     )
 
-    with patch("nanobot.providers.custom_provider.AsyncOpenAI") as mock_async_openai:
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as mock_async_openai:
         _make_provider(config)
 
     kwargs = mock_async_openai.call_args.kwargs
@@ -463,6 +456,147 @@ def test_agent_config_sets_active_path(monkeypatch, tmp_path: Path) -> None:
     assert seen["config_path"] == config_file.resolve()
 
 
+def test_agent_uses_workspace_directory_for_cron_store(monkeypatch, tmp_path: Path) -> None:
+    config_file = tmp_path / "instance" / "config.json"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text("{}")
+
+    config = Config()
+    config.agents.defaults.workspace = str(tmp_path / "agent-workspace")
+    seen: dict[str, Path] = {}
+
+    monkeypatch.setattr("nanobot.config.loader.set_config_path", lambda _path: None)
+    monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
+    monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
+    monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config: object())
+    monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: object())
+
+    class _FakeCron:
+        def __init__(self, store_path: Path) -> None:
+            seen["cron_store"] = store_path
+
+    class _FakeAgentLoop:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def process_direct(self, *_args, **_kwargs):
+            return OutboundMessage(channel="cli", chat_id="direct", content="ok")
+
+        async def close_mcp(self) -> None:
+            return None
+
+    monkeypatch.setattr("nanobot.cron.service.CronService", _FakeCron)
+    monkeypatch.setattr("nanobot.agent.loop.AgentLoop", _FakeAgentLoop)
+    monkeypatch.setattr("nanobot.cli.commands._print_agent_response", lambda *_args, **_kwargs: None)
+
+    result = runner.invoke(app, ["agent", "-m", "hello", "-c", str(config_file)])
+
+    assert result.exit_code == 0
+    assert seen["cron_store"] == config.workspace_path / "cron" / "jobs.json"
+
+
+def test_agent_workspace_override_does_not_migrate_legacy_cron(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_file = tmp_path / "instance" / "config.json"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text("{}")
+
+    legacy_dir = tmp_path / "global" / "cron"
+    legacy_dir.mkdir(parents=True)
+    legacy_file = legacy_dir / "jobs.json"
+    legacy_file.write_text('{"jobs": []}')
+
+    override = tmp_path / "override-workspace"
+    config = Config()
+    seen: dict[str, Path] = {}
+
+    monkeypatch.setattr("nanobot.config.loader.set_config_path", lambda _path: None)
+    monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
+    monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
+    monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config: object())
+    monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: object())
+    monkeypatch.setattr("nanobot.config.paths.get_cron_dir", lambda: legacy_dir)
+
+    class _FakeCron:
+        def __init__(self, store_path: Path) -> None:
+            seen["cron_store"] = store_path
+
+    class _FakeAgentLoop:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def process_direct(self, *_args, **_kwargs):
+            return OutboundMessage(channel="cli", chat_id="direct", content="ok")
+
+        async def close_mcp(self) -> None:
+            return None
+
+    monkeypatch.setattr("nanobot.cron.service.CronService", _FakeCron)
+    monkeypatch.setattr("nanobot.agent.loop.AgentLoop", _FakeAgentLoop)
+    monkeypatch.setattr("nanobot.cli.commands._print_agent_response", lambda *_args, **_kwargs: None)
+
+    result = runner.invoke(
+        app,
+        ["agent", "-m", "hello", "-c", str(config_file), "-w", str(override)],
+    )
+
+    assert result.exit_code == 0
+    assert seen["cron_store"] == override / "cron" / "jobs.json"
+    assert legacy_file.exists()
+    assert not (override / "cron" / "jobs.json").exists()
+
+
+def test_agent_custom_config_workspace_does_not_migrate_legacy_cron(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_file = tmp_path / "instance" / "config.json"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text("{}")
+
+    legacy_dir = tmp_path / "global" / "cron"
+    legacy_dir.mkdir(parents=True)
+    legacy_file = legacy_dir / "jobs.json"
+    legacy_file.write_text('{"jobs": []}')
+
+    custom_workspace = tmp_path / "custom-workspace"
+    config = Config()
+    config.agents.defaults.workspace = str(custom_workspace)
+    seen: dict[str, Path] = {}
+
+    monkeypatch.setattr("nanobot.config.loader.set_config_path", lambda _path: None)
+    monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
+    monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
+    monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config: object())
+    monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: object())
+    monkeypatch.setattr("nanobot.config.paths.get_cron_dir", lambda: legacy_dir)
+
+    class _FakeCron:
+        def __init__(self, store_path: Path) -> None:
+            seen["cron_store"] = store_path
+
+    class _FakeAgentLoop:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def process_direct(self, *_args, **_kwargs):
+            return OutboundMessage(channel="cli", chat_id="direct", content="ok")
+
+        async def close_mcp(self) -> None:
+            return None
+
+    monkeypatch.setattr("nanobot.cron.service.CronService", _FakeCron)
+    monkeypatch.setattr("nanobot.agent.loop.AgentLoop", _FakeAgentLoop)
+    monkeypatch.setattr("nanobot.cli.commands._print_agent_response", lambda *_args, **_kwargs: None)
+
+    result = runner.invoke(app, ["agent", "-m", "hello", "-c", str(config_file)])
+
+    assert result.exit_code == 0
+    assert seen["cron_store"] == custom_workspace / "cron" / "jobs.json"
+    assert legacy_file.exists()
+    assert not (custom_workspace / "cron" / "jobs.json").exists()
+
+
 def test_agent_overrides_workspace_path(mock_agent_runtime):
     workspace_path = Path("/tmp/agent-workspace")
 
@@ -569,7 +703,7 @@ def test_gateway_workspace_option_overrides_config(monkeypatch, tmp_path: Path) 
     assert config.workspace_path == override
 
 
-def test_gateway_uses_config_directory_for_cron_store(monkeypatch, tmp_path: Path) -> None:
+def test_gateway_uses_workspace_directory_for_cron_store(monkeypatch, tmp_path: Path) -> None:
     config_file = tmp_path / "instance" / "config.json"
     config_file.parent.mkdir(parents=True)
     config_file.write_text("{}")
@@ -594,13 +728,90 @@ def test_gateway_uses_config_directory_for_cron_store(monkeypatch, tmp_path: Pat
 
     result = runner.invoke(app, ["gateway", "--config", str(config_file)])
 
-<<<<<<< HEAD
     assert isinstance(result.exception, _StopGatewayError)
-    assert seen["cron_store"] == config_file.parent / "cron" / "jobs.json"
-=======
-    assert isinstance(result.exception, _StopGateway)
     assert seen["cron_store"] == config.workspace_path / "cron" / "jobs.json"
->>>>>>> c33e01e (fix(cron): scope cron job store to workspace instead of global directory)
+
+
+def test_gateway_workspace_override_does_not_migrate_legacy_cron(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_file = tmp_path / "instance" / "config.json"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text("{}")
+
+    legacy_dir = tmp_path / "global" / "cron"
+    legacy_dir.mkdir(parents=True)
+    legacy_file = legacy_dir / "jobs.json"
+    legacy_file.write_text('{"jobs": []}')
+
+    override = tmp_path / "override-workspace"
+    config = Config()
+    seen: dict[str, Path] = {}
+
+    monkeypatch.setattr("nanobot.config.loader.set_config_path", lambda _path: None)
+    monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
+    monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
+    monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config: object())
+    monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: object())
+    monkeypatch.setattr("nanobot.session.manager.SessionManager", lambda _workspace: object())
+    monkeypatch.setattr("nanobot.config.paths.get_cron_dir", lambda: legacy_dir)
+
+    class _StopCron:
+        def __init__(self, store_path: Path) -> None:
+            seen["cron_store"] = store_path
+            raise _StopGatewayError("stop")
+
+    monkeypatch.setattr("nanobot.cron.service.CronService", _StopCron)
+
+    result = runner.invoke(
+        app,
+        ["gateway", "--config", str(config_file), "--workspace", str(override)],
+    )
+
+    assert isinstance(result.exception, _StopGatewayError)
+    assert seen["cron_store"] == override / "cron" / "jobs.json"
+    assert legacy_file.exists()
+    assert not (override / "cron" / "jobs.json").exists()
+
+
+def test_gateway_custom_config_workspace_does_not_migrate_legacy_cron(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_file = tmp_path / "instance" / "config.json"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text("{}")
+
+    legacy_dir = tmp_path / "global" / "cron"
+    legacy_dir.mkdir(parents=True)
+    legacy_file = legacy_dir / "jobs.json"
+    legacy_file.write_text('{"jobs": []}')
+
+    custom_workspace = tmp_path / "custom-workspace"
+    config = Config()
+    config.agents.defaults.workspace = str(custom_workspace)
+    seen: dict[str, Path] = {}
+
+    monkeypatch.setattr("nanobot.config.loader.set_config_path", lambda _path: None)
+    monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
+    monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
+    monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config: object())
+    monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: object())
+    monkeypatch.setattr("nanobot.session.manager.SessionManager", lambda _workspace: object())
+    monkeypatch.setattr("nanobot.config.paths.get_cron_dir", lambda: legacy_dir)
+
+    class _StopCron:
+        def __init__(self, store_path: Path) -> None:
+            seen["cron_store"] = store_path
+            raise _StopGatewayError("stop")
+
+    monkeypatch.setattr("nanobot.cron.service.CronService", _StopCron)
+
+    result = runner.invoke(app, ["gateway", "--config", str(config_file)])
+
+    assert isinstance(result.exception, _StopGatewayError)
+    assert seen["cron_store"] == custom_workspace / "cron" / "jobs.json"
+    assert legacy_file.exists()
+    assert not (custom_workspace / "cron" / "jobs.json").exists()
 
 
 def test_migrate_cron_store_moves_legacy_file(tmp_path: Path) -> None:
