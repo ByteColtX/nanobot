@@ -41,6 +41,7 @@ _ACTION_GET_GROUP_MEMBER_INFO = "get_group_member_info"
 _ACTION_GET_FRIEND_LIST = "get_friend_list"
 _ACTION_SEND_GROUP_MSG = "send_group_msg"
 _ACTION_SEND_PRIVATE_MSG = "send_private_msg"
+_TRUNCATION_TAG = "<TRUNCATED>"
 _IMAGE_EXTENSIONS = frozenset(
     {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".heic", ".heif"}
 )
@@ -124,7 +125,7 @@ def _truncate_text(text: str, max_chars: int) -> str:
     """按配置截断文本。"""
     if max_chars <= 0 or len(text) <= max_chars:
         return text
-    return text[:max_chars] + "…"
+    return text[:max_chars] + _TRUNCATION_TAG
 
 
 
@@ -2277,6 +2278,7 @@ class _CQMsgRenderState:
         self_name: str,
         peer_name: str,
         count: int,
+        max_body_chars: int,
     ):
         """初始化渲染状态。"""
         self._chat = chat
@@ -2286,6 +2288,7 @@ class _CQMsgRenderState:
         self._peer_id = chat.user_id or ""
         self._peer_name = peer_name or self._peer_id or "peer"
         self._count = count
+        self._max_body_chars = max_body_chars
 
         self._user_rows: list[_UserRow] = []
         self._uid_by_qq: dict[str, str] = {}
@@ -2461,7 +2464,7 @@ class _CQMsgRenderState:
             )
             if chunk:
                 body_chunks.append(chunk)
-        body = _body_join(body_chunks) or "[empty]"
+        body = self._join_and_truncate_chunks(body_chunks) or "[empty]"
 
         if self._is_group:
             return f"N|{fid}.{index}|{sender_uid}|{body}"
@@ -2494,7 +2497,17 @@ class _CQMsgRenderState:
             if chunk:
                 chunks.append(chunk)
 
-        return _body_join(chunks), rendered_forwards
+        return self._join_and_truncate_chunks(chunks), rendered_forwards
+
+    def _join_and_truncate_chunks(self, chunks: list[str]) -> str:
+        """拼接并按配置截断消息 body，尽量保留完整 token 边界。"""
+        body = ""
+        for chunk in chunks:
+            candidate = chunk if not body else f"{body} {chunk}"
+            if self._max_body_chars > 0 and len(candidate) > self._max_body_chars:
+                return _truncate_text(candidate, self._max_body_chars)
+            body = candidate
+        return body
 
     def _render_token(
         self,
@@ -2616,6 +2629,7 @@ class CQMsgSerializer:
             self_name=self._self_name_getter(),
             peer_name=peer_name,
             count=len(records),
+            max_body_chars=self._config.context_msg_max_chars,
         )
         return renderer.render(records)
 
