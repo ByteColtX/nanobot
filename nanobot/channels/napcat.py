@@ -936,101 +936,77 @@ class NapCatMessageParser:
 
             seg_type = _coerce_str(segment.get("type")).strip().lower()
             data = _ensure_dict(segment.get("data"))
-
-            if seg_type == "text":
-                text = _coerce_str(data.get("text"))
-                if text:
-                    body_tokens.append(BodyToken(kind="text", text=text))
-                    parts.append(text)
-                continue
-
-            if seg_type == "at":
-                qq = _coerce_str(data.get("qq"))
-                if qq:
-                    body_tokens.append(BodyToken(kind="at", target_id=qq))
-                    parts.append("@全体成员" if qq == "all" else f"@{qq}")
-                    if self_id and qq == self_id:
-                        at_self = True
-                continue
-
-            if seg_type == "reply":
-                current_reply_id = _coerce_optional_str(data.get("id"))
-                if current_reply_id:
-                    body_tokens.append(BodyToken(kind="reply", message_id=current_reply_id))
-                    reply_id = reply_id or current_reply_id
-                    parts.append(f">m:{current_reply_id}")
-                continue
-
-            if seg_type == "forward":
-                content = [
-                    item for item in _ensure_list(data.get("content")) if isinstance(item, dict)
-                ]
-                forward_refs.append(
-                    ForwardRef(
-                        forward_id=_coerce_optional_str(data.get("id")),
-                        embedded_nodes=content,
-                        summary=(
-                            _coerce_optional_str(data.get("summary"))
-                            or _coerce_optional_str(data.get("title"))
-                        ),
+            
+            match seg_type:
+                case "text":
+                    text = _coerce_str(data.get("text"))
+                    if text:
+                        body_tokens.append(BodyToken(kind="text", text=text))
+                        parts.append(text)
+                case "at":
+                    qq = _coerce_str(data.get("qq"))
+                    if qq:
+                        body_tokens.append(BodyToken(kind="at", target_id=qq))
+                        parts.append("@全体成员" if qq == "all" else f"@{qq}")
+                        if self_id and qq == self_id:
+                            at_self = True
+                case "reply":
+                    current_reply_id = _coerce_optional_str(data.get("id"))
+                    if current_reply_id:
+                        body_tokens.append(BodyToken(kind="reply", message_id=current_reply_id))
+                        reply_id = reply_id or current_reply_id
+                        parts.append(f">m:{current_reply_id}")
+                case "forward":
+                    content = [
+                        item for item in _ensure_list(data.get("content")) if isinstance(item, dict)
+                    ]
+                    forward_refs.append(
+                        ForwardRef(
+                            forward_id=_coerce_optional_str(data.get("id")),
+                            embedded_nodes=content,
+                            summary=(
+                                _coerce_optional_str(data.get("summary"))
+                                or _coerce_optional_str(data.get("title"))
+                            ),
+                        )
                     )
-                )
-                body_tokens.append(BodyToken(kind="forward"))
-                parts.append("[forward]")
-                continue
-
-            if seg_type == "image":
-                name = _pick_segment_filename(data, "image")
-                url = _coerce_str(data.get("url"))
-                if _is_http_url(url):
-                    media_refs.append(
-                        MediaReference(kind="image", url=url, filename=name)
-                    )
-                body_tokens.append(BodyToken(kind="image", filename=name))
-                parts.append(f"[image:{name}]")
-                continue
-
-            if seg_type == "record":
-                name = _pick_segment_filename(data, "record")
-                url = _coerce_str(data.get("url"))
-                if _is_http_url(url):
-                    media_refs.append(
-                        MediaReference(kind="record", url=url, filename=name)
-                    )
-                body_tokens.append(BodyToken(kind="record", filename=name))
-                parts.append("[record]")
-                continue
-
-            if seg_type == "video":
-                name = _pick_segment_filename(data, "video")
-                body_tokens.append(BodyToken(kind="video", filename=name))
-                parts.append("[video]")
-                continue
-
-            if seg_type == "file":
-                name = _pick_segment_filename(data, "file")
-                body_tokens.append(BodyToken(kind="file", filename=name))
-                parts.append(f"[file:{name}]")
-                continue
-
-            if seg_type == "face":
-                face_id = _coerce_str(data.get("id")) or "unknown"
-                body_tokens.append(BodyToken(kind="face", text=face_id))
-                parts.append(f"[face:{face_id}]")
-                continue
-
-            if seg_type == "json":
-                body_tokens.append(BodyToken(kind="json"))
-                parts.append("[json]")
-                continue
-
-            if seg_type == "xml":
-                body_tokens.append(BodyToken(kind="xml"))
-                parts.append("[xml]")
-                continue
-
-            body_tokens.append(BodyToken(kind="unknown", text=seg_type or "unknown"))
-            parts.append(f"[seg:{seg_type or 'unknown'}]")
+                    body_tokens.append(BodyToken(kind="forward"))
+                    parts.append("[forward]")
+                case "image" | "record":
+                    name = _pick_segment_filename(data, seg_type)
+                    url = _coerce_str(data.get("url"))
+                    if _is_http_url(url):
+                        if seg_type == "image":
+                            media_refs.append(MediaReference(kind="image", url=url, filename=name))
+                        else:
+                            media_refs.append(MediaReference(kind="record", url=url, filename=name))
+                    if seg_type == "image":
+                        body_tokens.append(BodyToken(kind="image", filename=name))
+                        parts.append(f"[image:{name}]")
+                    else:
+                        body_tokens.append(BodyToken(kind="record", filename=name))
+                        parts.append("[record]")
+                case "video" | "file":
+                    name = _pick_segment_filename(data, seg_type)
+                    if seg_type == "video":
+                        body_tokens.append(BodyToken(kind="video", filename=name))
+                        parts.append("[video]")
+                    else:
+                        body_tokens.append(BodyToken(kind="file", filename=name))
+                        parts.append(f"[file:{name}]")
+                case "face":
+                    face_id = _coerce_str(data.get("id")) or "unknown"
+                    body_tokens.append(BodyToken(kind="face", text=face_id))
+                    parts.append(f"[face:{face_id}]")
+                case "json" | "xml":
+                    if seg_type == "json":
+                        body_tokens.append(BodyToken(kind="json"))
+                    else:
+                        body_tokens.append(BodyToken(kind="xml"))
+                    parts.append(f"[{seg_type}]")
+                case _:
+                    body_tokens.append(BodyToken(kind="unknown", text=seg_type or "unknown"))
+                    parts.append(f"[seg:{seg_type or 'unknown'}]")
 
         text = _body_join(parts)
         return ParsedMessage(
