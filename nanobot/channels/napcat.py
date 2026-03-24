@@ -21,6 +21,7 @@ from pydantic import Field
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
 from nanobot.security.network import validate_resolved_url, validate_url_target
 
@@ -1240,7 +1241,7 @@ class MediaDownloader:
 
     def __init__(self, config: NapCatConfig):
         """初始化媒体下载器。"""
-        base_dir = Path(config.media_dir).expanduser() if config.media_dir else Path("media/napcat")
+        base_dir = Path(config.media_dir).expanduser() if config.media_dir else get_media_dir("napcat")
         self._root = base_dir
         self._timeout = config.media_download_timeout
         self._max_size_bytes = config.media_max_size_mb * 1024 * 1024
