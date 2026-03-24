@@ -34,6 +34,13 @@ _CHAT_ID_GROUP_PREFIX = "g:"
 _CHAT_ID_PRIVATE_PREFIX = "p:"
 _CQMSG_VERSION = "CQMSG/1"
 _SUPPORTED_COMMANDS = frozenset({"/new", "/stop", "/restart", "/status", "/help"})
+_ACTION_GET_LOGIN_INFO = "get_login_info"
+_ACTION_GET_MSG = "get_msg"
+_ACTION_GET_FORWARD_MSG = "get_forward_msg"
+_ACTION_GET_GROUP_MEMBER_INFO = "get_group_member_info"
+_ACTION_GET_FRIEND_LIST = "get_friend_list"
+_ACTION_SEND_GROUP_MSG = "send_group_msg"
+_ACTION_SEND_PRIVATE_MSG = "send_private_msg"
 _IMAGE_EXTENSIONS = frozenset(
     {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".heic", ".heif"}
 )
@@ -1330,7 +1337,7 @@ class NapCatMessageDetailFetcher:
 
     async def get_msg(self, message_id: str) -> dict[str, Any] | None:
         """获取单条消息详情。"""
-        response = await self._transport.call_action("get_msg", {"message_id": message_id})
+        response = await self._transport.call_action(_ACTION_GET_MSG, {"message_id": message_id})
         data = response.get("data")
         if isinstance(data, dict):
             if isinstance(data.get("message"), dict):
@@ -1341,7 +1348,7 @@ class NapCatMessageDetailFetcher:
 
     async def get_forward_msg(self, forward_id: str) -> list[dict[str, Any]]:
         """获取合并转发详情。"""
-        response = await self._transport.call_action("get_forward_msg", {"id": forward_id})
+        response = await self._transport.call_action(_ACTION_GET_FORWARD_MSG, {"id": forward_id})
         data = response.get("data")
         if isinstance(data, dict) and isinstance(data.get("messages"), list):
             return [item for item in data["messages"] if isinstance(item, dict)]
@@ -1449,7 +1456,7 @@ class ContactDirectory:
 
             try:
                 response = await self._transport.call_action(
-                    "get_group_member_info",
+                    _ACTION_GET_GROUP_MEMBER_INFO,
                     {
                         "group_id": group_id,
                         "user_id": user_id,
@@ -1507,7 +1514,7 @@ class ContactDirectory:
                 return
 
             try:
-                response = await self._transport.call_action("get_friend_list", {})
+                response = await self._transport.call_action(_ACTION_GET_FRIEND_LIST, {})
                 data = response.get("data")
                 if not isinstance(data, list):
                     logger.warning(
@@ -2671,13 +2678,13 @@ class OutboundSender:
         params: dict[str, Any]
         action: str
         if route == "group":
-            action = "send_group_msg"
+            action = _ACTION_SEND_GROUP_MSG
             params = {
                 "group_id": target_id,
                 "message": content,
             }
         else:
-            action = "send_private_msg"
+            action = _ACTION_SEND_PRIVATE_MSG
             params = {
                 "user_id": target_id,
                 "message": content,
@@ -3077,7 +3084,7 @@ class NapCatChannel(BaseChannel):
                 await asyncio.sleep(0.05)
 
             if not self._self_id or not self._self_name:
-                response = await self._transport.call_action("get_login_info", {})
+                response = await self._transport.call_action(_ACTION_GET_LOGIN_INFO, {})
                 self._apply_login_info(response)
         except asyncio.CancelledError:
             raise
