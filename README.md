@@ -382,6 +382,7 @@ If you prefer to configure manually, add the following to `~/.nanobot/config.jso
 > - `"mention"` (default) — Only respond when @mentioned
 > - `"open"` — Respond to all messages
 > DMs always respond when the sender is in `allowFrom`.
+> - If you set group policy to open create new threads as private threads and then @ the bot into it. Otherwise the thread itself and the channel in which you spawned it will spawn a bot session.
 
 **5. Invite the bot**
 - OAuth2 → URL Generator
@@ -758,6 +759,7 @@ pip install -e ".[weixin]"
 
 > - `allowFrom`: Add the sender ID you see in nanobot logs for your WeChat account. Use `["*"]` to allow all users.
 > - `token`: Optional. If omitted, log in interactively and nanobot will save the token for you.
+> - `routeTag`: Optional. When your upstream Weixin deployment requires request routing, nanobot will send it as the `SKRouteTag` header.
 > - `stateDir`: Optional. Defaults to nanobot's runtime directory for Weixin state.
 > - `pollTimeout`: Optional long-poll timeout in seconds.
 
