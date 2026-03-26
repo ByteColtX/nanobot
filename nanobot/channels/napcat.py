@@ -1553,6 +1553,7 @@ class Enricher:
         fetcher: NapCatMessageDetailFetcher,
         normalizer: NapCatNormalizer,
         directory: ContactDirectory,
+        transcriber: Callable[[str | Path], Awaitable[str]],
     ):
         """初始化补全器。"""
         self._config = config
@@ -1560,12 +1561,13 @@ class Enricher:
         self._fetcher = fetcher
         self._normalizer = normalizer
         self._directory = directory
+        self._transcriber = transcriber
 
     async def enrich(self, inbound: NormalizedInbound) -> EnrichedInbound:
         """补全主消息、引用消息与转发消息。"""
         await self._directory.resolve_inbound_sender_name(inbound)
 
-        main_task = asyncio.create_task(self._downloader.download_many(inbound.media_refs))
+        main_task = asyncio.create_task(self._expand_main_media(inbound))
         reply_task = asyncio.create_task(self._expand_reply_media(inbound.reply_id))
         forward_tasks = [
             asyncio.create_task(self._expand_forward(ref, inbound.chat))
@@ -1597,6 +1599,28 @@ class Enricher:
             forward_bundles=forward_bundles,
             forward_media_paths=_dedupe_keep_order(forward_media_paths),
         )
+
+    async def _expand_main_media(self, inbound: NormalizedInbound) -> list[str]:
+        """下载主消息媒体，并为语音补充转写文本。"""
+        if not inbound.media_refs:
+            return []
+
+        media_paths: list[str] = []
+        record_transcriptions: list[str | None] = []
+
+        for ref in inbound.media_refs:
+            path = await self._downloader.download(ref)
+            if path:
+                media_paths.append(path)
+
+            if ref.kind != "record":
+                continue
+
+            transcription = await self._transcribe_record(path)
+            record_transcriptions.append(transcription or None)
+
+        self._inject_record_transcriptions(inbound, record_transcriptions)
+        return _dedupe_keep_order(media_paths)
 
     async def _expand_reply_media(self, reply_id: str | None) -> list[str]:
         """展开 reply 消息中的媒体。"""
@@ -1668,6 +1692,58 @@ class Enricher:
                 forward_ref.forward_id,
             )
             return bundle, []
+
+    async def _transcribe_record(self, path: str | None) -> str:
+        """转写单个语音文件，失败时返回空字符串。"""
+        if not path:
+            return ""
+
+        try:
+            transcription = (await self._transcriber(path)).strip()
+            if transcription:
+                logger.info(
+                    "NapCat [MEDIA] transcribed record path={} preview={!r}",
+                    path,
+                    transcription[:80],
+                )
+            return transcription
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("NapCat [MEDIA] transcribe record failed path={}", path)
+            return ""
+
+    @staticmethod
+    def _inject_record_transcriptions(
+        inbound: NormalizedInbound,
+        record_transcriptions: list[str | None],
+    ) -> None:
+        """把语音转写结果注入正文与 CQMSG body tokens。"""
+        if not record_transcriptions:
+            return
+
+        updated_tokens: list[BodyToken] = []
+        text = inbound.text
+        transcript_iter = iter(record_transcriptions)
+        injected = False
+
+        for token in inbound.body_tokens:
+            updated_tokens.append(token)
+            if token.kind != "record":
+                continue
+
+            transcription = next(transcript_iter, None)
+            if not transcription:
+                continue
+
+            marker = f"[transcription: {transcription}]"
+            updated_tokens.append(BodyToken(kind="text", text=marker))
+            text = text.replace("[record]", f"[record] {marker}", 1)
+            injected = True
+
+        if injected:
+            inbound.body_tokens = updated_tokens
+            inbound.text = text
 
     def _normalize_forward_node(
         self,
@@ -3061,6 +3137,7 @@ class NapCatChannel(BaseChannel):
             fetcher=self._fetcher,
             normalizer=self._normalizer,
             directory=self._directory,
+            transcriber=self.transcribe_audio,
         )
         self._serializer = CQMsgSerializer(
             self.config,
