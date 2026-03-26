@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
-import hashlib
 import re
+import shutil
+import tempfile
 import time
 import uuid
 from collections import deque
@@ -48,6 +50,9 @@ _IMAGE_EXTENSIONS = frozenset(
 )
 _AUDIO_EXTENSIONS = frozenset(
     {".mp3", ".wav", ".ogg", ".opus", ".m4a", ".aac", ".flac", ".amr", ".silk"}
+)
+_GROQ_SUPPORTED_TRANSCRIPTION_EXTENSIONS = frozenset(
+    {".flac", ".m4a", ".mp3", ".mp4", ".mpeg", ".mpga", ".ogg", ".wav", ".webm"}
 )
 _VIDEO_EXTENSIONS = frozenset(
     {".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv"}
@@ -1554,6 +1559,7 @@ class Enricher:
         normalizer: NapCatNormalizer,
         directory: ContactDirectory,
         transcriber: Callable[[str | Path], Awaitable[str]],
+        transcription_enabled: Callable[[], bool],
     ):
         """初始化补全器。"""
         self._config = config
@@ -1562,6 +1568,8 @@ class Enricher:
         self._normalizer = normalizer
         self._directory = directory
         self._transcriber = transcriber
+        self._transcription_enabled = transcription_enabled
+        self._warned_missing_transcription_key = False
 
     async def enrich(self, inbound: NormalizedInbound) -> EnrichedInbound:
         """补全主消息、引用消息与转发消息。"""
@@ -1698,20 +1706,36 @@ class Enricher:
         if not path:
             return ""
 
+        if not self._transcription_enabled():
+            if not self._warned_missing_transcription_key:
+                logger.warning(
+                    "NapCat [MEDIA] skipping voice transcription because providers.groq.api_key is not configured"
+                )
+                self._warned_missing_transcription_key = True
+            return ""
+
+        prepared_path, cleanup_prepared_path = await self._prepare_record_for_transcription(Path(path))
+        if prepared_path is None:
+            return ""
+
         try:
-            transcription = (await self._transcriber(path)).strip()
+            transcription = (await self._transcriber(prepared_path)).strip()
             if transcription:
                 logger.info(
                     "NapCat [MEDIA] transcribed record path={} preview={!r}",
-                    path,
+                    prepared_path,
                     transcription[:80],
                 )
             return transcription
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("NapCat [MEDIA] transcribe record failed path={}", path)
+            logger.exception("NapCat [MEDIA] transcribe record failed path={}", prepared_path)
             return ""
+        finally:
+            if cleanup_prepared_path:
+                with contextlib.suppress(FileNotFoundError):
+                    prepared_path.unlink()
 
     @staticmethod
     def _inject_record_transcriptions(
@@ -1744,6 +1768,67 @@ class Enricher:
         if injected:
             inbound.body_tokens = updated_tokens
             inbound.text = text
+
+    async def _prepare_record_for_transcription(self, path: Path) -> tuple[Path | None, bool]:
+        """Return a Groq-compatible audio path for transcription."""
+        suffix = path.suffix.lower()
+        if suffix in _GROQ_SUPPORTED_TRANSCRIPTION_EXTENSIONS:
+            return path, False
+        return await self._transcode_record_for_transcription(path)
+
+    async def _transcode_record_for_transcription(
+        self,
+        path: Path,
+    ) -> tuple[Path | None, bool]:
+        """Transcode NapCat voice formats like AMR/SILK to WAV before transcription."""
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            logger.warning(
+                "NapCat [MEDIA] ffmpeg not found; cannot transcode voice message for transcription path={}",
+                path,
+            )
+            return None, False
+
+        with tempfile.NamedTemporaryFile(
+            prefix="nanobot-napcat-transcription-",
+            suffix=".wav",
+            delete=False,
+        ) as tmp:
+            output_path = Path(tmp.name)
+
+        process = await asyncio.create_subprocess_exec(
+            ffmpeg,
+            "-y",
+            "-i",
+            str(path),
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            str(output_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            with contextlib.suppress(FileNotFoundError):
+                output_path.unlink()
+            logger.warning(
+                "NapCat [MEDIA] ffmpeg transcode failed path={} rc={} detail={!r}",
+                path,
+                process.returncode,
+                stderr.decode("utf-8", errors="replace")[-400:],
+            )
+            return None, False
+
+        logger.info(
+            "NapCat [MEDIA] transcoded voice for transcription source={} output={}",
+            path.name,
+            output_path.name,
+        )
+        return output_path, True
 
     def _normalize_forward_node(
         self,
@@ -3138,6 +3223,7 @@ class NapCatChannel(BaseChannel):
             normalizer=self._normalizer,
             directory=self._directory,
             transcriber=self.transcribe_audio,
+            transcription_enabled=lambda: bool(self.transcription_api_key),
         )
         self._serializer = CQMsgSerializer(
             self.config,
