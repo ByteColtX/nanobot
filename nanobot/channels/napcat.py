@@ -270,9 +270,6 @@ def _parse_internal_chat_id(chat_id: str) -> tuple[Literal["group", "private"], 
     if chat_id.startswith(_CHAT_ID_PRIVATE_PREFIX):
         return "private", chat_id[len(_CHAT_ID_PRIVATE_PREFIX):]
     raise ValueError(f"不支持的 chat_id 格式: {chat_id}")
-
-
-
 def _pick_segment_filename(data: dict[str, Any], fallback: str) -> str:
     """从消息段数据中提取尽量稳定的文件名。"""
     for key in ("file", "name", "path", "url"):
@@ -1185,11 +1182,12 @@ class NapCatNormalizer:
             return None
 
         chat_id = f"{_CHAT_ID_PRIVATE_PREFIX}{user_id}"
+        group_id = _coerce_optional_str(payload.get("group_id"))
         target_id = _coerce_optional_str(payload.get("target_id"))
         temp_source = _coerce_int(payload.get("temp_source"))
 
-        if sub_type == "group" and target_id:
-            session_key = f"{self._channel_name}:pt:{target_id}:{user_id}"
+        if sub_type == "group" and group_id:
+            session_key = f"{self._channel_name}:pt:{group_id}:{user_id}"
         else:
             session_key = f"{self._channel_name}:{chat_id}"
 
@@ -1756,9 +1754,9 @@ def extract_session_key(payload: dict[str, Any], self_id: str) -> str | None:
 
     if message_type == "private" and user_id:
         sub_type = _coerce_str(payload.get("sub_type")).strip().lower()
-        target_id = _coerce_optional_str(payload.get("target_id"))
-        if sub_type == "group" and target_id:
-            return f"napcat:pt:{target_id}:{user_id}"
+        group_id = _coerce_optional_str(payload.get("group_id"))
+        if sub_type == "group" and group_id:
+            return f"napcat:pt:{group_id}:{user_id}"
         return f"napcat:{_CHAT_ID_PRIVATE_PREFIX}{user_id}"
 
     return None
@@ -1784,13 +1782,13 @@ def _resolve_source_group_id(
     post_type: str,
     message_type: str,
 ) -> str | None:
-    """群消息、群通知取 `group_id`；群临时私聊取 `target_id`。"""
+    """群消息、群通知、群临时私聊都取 `group_id`。"""
     if post_type == "notice" or message_type == "group":
         return _coerce_optional_str(payload.get("group_id"))
     if message_type == "private":
         sub_type = _coerce_str(payload.get("sub_type")).strip().lower()
         if sub_type == "group":
-            return _coerce_optional_str(payload.get("target_id"))
+            return _coerce_optional_str(payload.get("group_id"))
     return None
 
 
