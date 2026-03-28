@@ -3194,6 +3194,7 @@ class NapCatChannel(BaseChannel):
         self._self_id = ""
         self._self_name = ""
         self._identity_task: asyncio.Task[None] | None = None
+        self._transport_task: asyncio.Task[None] | None = None
         self._media_root = (
             Path(self.config.media_dir).expanduser()
             if self.config.media_dir
@@ -3263,8 +3264,12 @@ class NapCatChannel(BaseChannel):
             logger.error("NapCat [CONN] invalid websocket url url={}", self.config.url)
             return
 
+        if self._transport_task is not None and not self._transport_task.done():
+            logger.debug("NapCat [CONN] start ignored because transport task is already running")
+            return
+
         self._running = True
-        await self._transport.start()
+        self._transport_task = asyncio.create_task(self._transport.start())
 
     async def stop(self) -> None:
         """停止 NapCat Channel。"""
@@ -3276,6 +3281,10 @@ class NapCatChannel(BaseChannel):
             self._identity_task = None
         await self._router.stop()
         await self._transport.stop()
+        if self._transport_task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._transport_task
+            self._transport_task = None
 
     async def send(self, msg: OutboundMessage) -> None:
         """通过 NapCat 发送一条消息。"""
