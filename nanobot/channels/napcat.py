@@ -1,3 +1,5 @@
+"""NapCat chat channel adapter for OneBot-style QQ messaging."""
+
 from __future__ import annotations
 
 import asyncio
