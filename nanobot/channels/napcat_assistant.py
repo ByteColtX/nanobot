@@ -50,6 +50,7 @@ class NapCatAssistantConfig(Base):
     token: str = ""
     allow_from: list[str] = Field(default_factory=lambda: ["*"])
     ignore_self_messages: bool = True
+    trigger_on_at_self: bool = True
     assistant_command: str = "/nanobot"
     long_reply_forward_threshold: int = Field(default=_DEFAULT_FORWARD_MAX_CHARS, ge=0)
     media_dir: str = ""
@@ -390,7 +391,7 @@ class NapCatAssistantChannel(BaseChannel):
 
         if normalized.chat.route == "private":
             return "private", text
-        if normalized.at_self:
+        if self.config.trigger_on_at_self and normalized.at_self:
             return "at_self", text
         return None, text
 
